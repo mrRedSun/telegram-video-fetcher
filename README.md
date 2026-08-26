@@ -1,0 +1,32 @@
+# Telegram Video Fetcher
+
+A small Go Telegram bot that replies to messages containing video-page URLs. It uses `yt-dlp` for public media, uploads results below Telegram's hosted Bot API limit, and remembers Telegram `file_id` values so repeated URLs are resent without downloading or uploading again.
+
+## Behavior
+
+- Handles up to five HTTP(S) URLs per message in groups and direct messages.
+- Supports individual public pages handled by `yt-dlp`; playlists and live streams are rejected.
+- Selects a single-file result below 49 MB and rejects media longer than one hour when duration is known.
+- Uses three bounded workers and a 64-item queue.
+- Stores only a BoltDB URL-to-`file_id` cache. Downloads use a 256 MB RAM-backed temporary filesystem and are removed after every attempt.
+- Access is unrestricted. Do not add the bot to groups where unrestricted downloading is undesirable.
+
+## Telegram setup
+
+Create a bot with BotFather. Disable privacy mode with `/setprivacy` if it should see ordinary group messages rather than commands and direct mentions only.
+
+Copy `.env.example` to `.env`, replace the value with the BotFather token, and protect it:
+
+```sh
+cp .env.example .env
+chmod 600 .env
+docker compose up -d
+```
+
+Never commit `.env`. No cookies or authenticated downloading are supported by the default deployment.
+
+## Limits
+
+Telegram's hosted Bot API accepts bot uploads up to 50 MB. The bot uses 49 MB as a safety margin. Some sites do not expose reliable sizes before download; those requests may download temporarily and then be rejected. The tmpfs and timeout bound resource consumption.
+
+Site extractors change frequently. Rebuild the image after updating the pinned `YT_DLP_VERSION` in `Dockerfile`.
