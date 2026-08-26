@@ -3,6 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,8 +48,12 @@ type update struct {
 }
 type message struct {
 	MessageID int64 `json:"message_id"`
-	Chat      struct {
+	From      *struct {
 		ID int64 `json:"id"`
+	} `json:"from"`
+	Chat struct {
+		ID   int64  `json:"id"`
+		Type string `json:"type"`
 	} `json:"chat"`
 	Text    string `json:"text"`
 	Caption string `json:"caption"`
@@ -54,7 +62,20 @@ type job struct {
 	ChatID, MessageID int64
 	URL               string
 }
-type cache struct{ db *bolt.DB }
+type cache struct {
+	db   *bolt.DB
+	salt []byte
+}
+
+type analyticsSummary struct {
+	StartedAt            int64  `json:"started_at"`
+	LastSeenAt           int64  `json:"last_seen_at"`
+	MessagesWithURLs     uint64 `json:"messages_with_urls"`
+	URLsSubmitted        uint64 `json:"urls_submitted"`
+	SuccessfulDeliveries uint64 `json:"successful_deliveries"`
+	CacheHits            uint64 `json:"cache_hits"`
+	Failures             uint64 `json:"failures"`
+}
 type tgResponse struct {
 	OK          bool            `json:"ok"`
 	Description string          `json:"description"`
@@ -161,8 +182,24 @@ func main() {
 	if err := c.init(); err != nil {
 		panic(err)
 	}
+	if os.Getenv("ANALYTICS_REPORT") != "" {
+		if err := c.reportAnalytics(os.Stdout); err != nil {
+			panic(err)
+		}
+		return
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
+	reportSignal := make(chan os.Signal, 1)
+	signal.Notify(reportSignal, syscall.SIGUSR1)
+	defer signal.Stop(reportSignal)
+	go func() {
+		for range reportSignal {
+			if err := c.reportAnalytics(os.Stdout); err != nil {
+				slog.Warn("analytics report failed", "error", err)
+			}
+		}
+	}()
 	a := &api{base: "https://api.telegram.org/bot" + cfg.Token, client: &http.Client{Timeout: cfg.Timeout + time.Minute}}
 	jobs := make(chan job, cfg.QueueSize)
 	var wg sync.WaitGroup
@@ -170,7 +207,7 @@ func main() {
 		wg.Add(1)
 		go func() { defer wg.Done(); worker(ctx, cfg, a, c, jobs) }()
 	}
-	poll(ctx, cfg, a, jobs)
+	poll(ctx, cfg, a, c, jobs)
 	close(jobs)
 	wg.Wait()
 }
@@ -196,7 +233,7 @@ func envInt(k string, d int) int {
 	return d
 }
 
-func poll(ctx context.Context, cfg config, a *api, jobs chan<- job) {
+func poll(ctx context.Context, cfg config, a *api, c *cache, jobs chan<- job) {
 	var offset int64
 	for ctx.Err() == nil {
 		var out []update
@@ -217,11 +254,21 @@ func poll(ctx context.Context, cfg config, a *api, jobs chan<- job) {
 			}
 			text := u.Message.Text + " " + u.Message.Caption
 			urls := extractURLs(text, cfg.MaxURLs)
+			if len(urls) > 0 {
+				var userID int64
+				if u.Message.From != nil {
+					userID = u.Message.From.ID
+				}
+				if err := c.recordMessage(userID, u.Message.Chat.ID, u.Message.Chat.Type, len(urls)); err != nil {
+					slog.Warn("analytics message update failed", "error", err)
+				}
+			}
 			for _, raw := range urls {
 				select {
 				case jobs <- job{u.Message.Chat.ID, u.Message.MessageID, raw}:
 				default:
 					slog.Warn("download queue full", "host", host(raw))
+					_ = c.recordOutcome(false, false)
 				}
 			}
 		}
@@ -254,6 +301,7 @@ func worker(ctx context.Context, cfg config, a *api, c *cache, jobs <-chan job) 
 		key := "media-v4:" + normalize(j.URL)
 		if id, _ := c.get(key); id != "" {
 			if err := a.sendCached(ctx, j, id); err == nil {
+				_ = c.recordOutcome(true, true)
 				continue
 			}
 		}
@@ -261,12 +309,14 @@ func worker(ctx context.Context, cfg config, a *api, c *cache, jobs <-chan job) 
 		dir, err := os.MkdirTemp(cfg.TempDir, "job-")
 		if err != nil {
 			cancel()
+			_ = c.recordOutcome(false, false)
 			continue
 		}
 		path, err := download(dctx, dir, j.URL)
 		if err != nil {
 			cancel()
 			slog.Warn("download failed", "error", err, "host", host(j.URL))
+			_ = c.recordOutcome(false, false)
 			os.RemoveAll(dir)
 			continue
 		}
@@ -274,20 +324,24 @@ func worker(ctx context.Context, cfg config, a *api, c *cache, jobs <-chan job) 
 		cancel()
 		if err != nil {
 			slog.Warn("media validation failed", "error", err, "host", host(j.URL))
+			_ = c.recordOutcome(false, false)
 			os.RemoveAll(dir)
 			continue
 		}
 		st, err := os.Stat(path)
 		if err != nil || st.Size() > maxUpload {
 			slog.Warn("prepared video exceeds upload limit", "host", host(j.URL))
+			_ = c.recordOutcome(false, false)
 			os.RemoveAll(dir)
 			continue
 		}
 		fileID, err := a.upload(ctx, j, path, meta)
 		if err != nil {
 			slog.Error("upload failed", "error", err, "host", host(j.URL))
+			_ = c.recordOutcome(false, false)
 		} else {
 			_ = c.put(key, fileID)
+			_ = c.recordOutcome(true, false)
 		}
 		os.RemoveAll(dir)
 	}
@@ -525,7 +579,124 @@ func normalize(raw string) string {
 func host(raw string) string { u, _ := url.Parse(raw); return u.Hostname() }
 
 func (c *cache) init() error {
-	return c.db.Update(func(tx *bolt.Tx) error { _, e := tx.CreateBucketIfNotExists([]byte("files")); return e })
+	return c.db.Update(func(tx *bolt.Tx) error {
+		for _, name := range []string{"files", "analytics_users", "analytics_chats", "analytics_meta", "analytics_summary"} {
+			if _, err := tx.CreateBucketIfNotExists([]byte(name)); err != nil {
+				return err
+			}
+		}
+		meta := tx.Bucket([]byte("analytics_meta"))
+		salt := meta.Get([]byte("salt"))
+		if len(salt) == 0 {
+			salt = make([]byte, 32)
+			if _, err := rand.Read(salt); err != nil {
+				return err
+			}
+			if err := meta.Put([]byte("salt"), salt); err != nil {
+				return err
+			}
+		}
+		c.salt = append([]byte(nil), salt...)
+		return nil
+	})
+}
+
+func (c *cache) anonymousID(kind byte, id int64) []byte {
+	mac := hmac.New(sha256.New, c.salt)
+	mac.Write([]byte{kind})
+	var raw [8]byte
+	binary.BigEndian.PutUint64(raw[:], uint64(id))
+	mac.Write(raw[:])
+	return mac.Sum(nil)
+}
+
+func (c *cache) recordMessage(userID, chatID int64, chatType string, urlCount int) error {
+	now := time.Now().Unix()
+	return c.db.Update(func(tx *bolt.Tx) error {
+		if userID != 0 {
+			if err := tx.Bucket([]byte("analytics_users")).Put(c.anonymousID('u', userID), []byte(strconv.FormatInt(now, 10))); err != nil {
+				return err
+			}
+		}
+		if err := tx.Bucket([]byte("analytics_chats")).Put(c.anonymousID('c', chatID), []byte(chatType)); err != nil {
+			return err
+		}
+		s, err := readSummary(tx)
+		if err != nil {
+			return err
+		}
+		if s.StartedAt == 0 {
+			s.StartedAt = now
+		}
+		s.LastSeenAt = now
+		s.MessagesWithURLs++
+		s.URLsSubmitted += uint64(urlCount)
+		return writeSummary(tx, s)
+	})
+}
+
+func (c *cache) recordOutcome(success, cacheHit bool) error {
+	return c.db.Update(func(tx *bolt.Tx) error {
+		s, err := readSummary(tx)
+		if err != nil {
+			return err
+		}
+		if success {
+			s.SuccessfulDeliveries++
+			if cacheHit {
+				s.CacheHits++
+			}
+		} else {
+			s.Failures++
+		}
+		return writeSummary(tx, s)
+	})
+}
+
+func readSummary(tx *bolt.Tx) (analyticsSummary, error) {
+	var s analyticsSummary
+	raw := tx.Bucket([]byte("analytics_summary")).Get([]byte("totals"))
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return s, err
+		}
+	}
+	return s, nil
+}
+
+func writeSummary(tx *bolt.Tx, s analyticsSummary) error {
+	raw, err := json.Marshal(s)
+	if err != nil {
+		return err
+	}
+	return tx.Bucket([]byte("analytics_summary")).Put([]byte("totals"), raw)
+}
+
+func (c *cache) reportAnalytics(w io.Writer) error {
+	return c.db.View(func(tx *bolt.Tx) error {
+		s, err := readSummary(tx)
+		if err != nil {
+			return err
+		}
+		users := tx.Bucket([]byte("analytics_users")).Stats().KeyN
+		chats := tx.Bucket([]byte("analytics_chats"))
+		private, groups := 0, 0
+		_ = chats.ForEach(func(_, value []byte) error {
+			if string(value) == "private" {
+				private++
+			} else {
+				groups++
+			}
+			return nil
+		})
+		fmt.Fprintln(w, "METRIC\tVALUE")
+		fmt.Fprintf(w, "unique_users\t%d\nunique_chats\t%d\nprivate_chats\t%d\ngroup_chats\t%d\n", users, chats.Stats().KeyN, private, groups)
+		fmt.Fprintf(w, "messages_with_urls\t%d\nurls_submitted\t%d\nsuccessful_deliveries\t%d\ncache_hits\t%d\nfailures\t%d\n", s.MessagesWithURLs, s.URLsSubmitted, s.SuccessfulDeliveries, s.CacheHits, s.Failures)
+		if s.StartedAt > 0 {
+			fmt.Fprintf(w, "tracking_since_utc\t%s\nlast_activity_utc\t%s\n", time.Unix(s.StartedAt, 0).UTC().Format(time.RFC3339), time.Unix(s.LastSeenAt, 0).UTC().Format(time.RFC3339))
+		}
+		return nil
+	})
 }
 func (c *cache) get(k string) (string, error) {
 	var v string

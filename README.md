@@ -30,3 +30,18 @@ Never commit `.env`. No cookies or authenticated downloading are supported by th
 Telegram's hosted Bot API accepts bot uploads up to 50 MB. The bot uses 49 MB as a safety margin. Some sites do not expose reliable sizes before download; those requests may download temporarily and then be rejected. The tmpfs and timeout bound resource consumption.
 
 Site extractors change frequently. Rebuild the image after updating the pinned `YT_DLP_VERSION` in `Dockerfile`.
+
+## Analytics
+
+Analytics begin when the feature is deployed. The bot stores salted hashes of
+Telegram user and chat IDs plus aggregate counters; it does not store usernames,
+message text, links, or raw Telegram IDs in analytics. To print the live report
+without stopping the bot:
+
+```sh
+docker compose kill -s USR1 bot
+docker compose logs --since=1m
+```
+
+The report includes unique users/chats, private/group split, URL messages,
+submitted URLs, successful deliveries, Telegram cache hits, and silent failures.
