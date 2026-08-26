@@ -98,6 +98,28 @@ type formatChoice struct {
 }
 
 func main() {
+	if probe := os.Getenv("PROBE_URL"); probe != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		dir, err := os.MkdirTemp("", "probe-")
+		if err != nil {
+			panic(err)
+		}
+		defer os.RemoveAll(dir)
+		path, err := download(ctx, dir, probe)
+		if err != nil {
+			panic(err)
+		}
+		st, err := os.Stat(path)
+		if err != nil {
+			panic(err)
+		}
+		if st.Size() > maxUpload {
+			panic("probe output exceeds upload limit")
+		}
+		slog.Info("probe succeeded", "bytes", st.Size(), "file", filepath.Base(path))
+		return
+	}
 	cfg, err := loadConfig()
 	if err != nil {
 		panic(err)
@@ -283,7 +305,7 @@ func chooseFormat(ctx context.Context, raw string) (string, error) {
 func selectFormat(info mediaInfo, budget int64) (formatChoice, bool) {
 	var knownBest, unknownBest formatChoice
 	var haveKnown, haveUnknown bool
-	consider := func(c formatChoice, height float64) {
+	consider := func(c formatChoice, width, height float64) {
 		if c.Known {
 			if c.Size <= budget && (!haveKnown || c.Score > knownBest.Score) {
 				knownBest, haveKnown = c, true
@@ -291,7 +313,7 @@ func selectFormat(info mediaInfo, budget int64) (formatChoice, bool) {
 			return
 		}
 		// With no trustworthy size, 1080p is the highest conservative fallback.
-		if height <= 1080 && (!haveUnknown || c.Score > unknownBest.Score) {
+		if portraitAware1080p(width, height) && (!haveUnknown || c.Score > unknownBest.Score) {
 			unknownBest, haveUnknown = c, true
 		}
 	}
@@ -303,7 +325,7 @@ func selectFormat(info mediaInfo, budget int64) (formatChoice, bool) {
 		size, known := formatSize(f, info.Duration)
 		switch {
 		case hasVideo && hasAudio:
-			consider(formatChoice{Selector: f.ID, Score: videoScore(f) + audioScore(f), Size: size, Known: known}, f.Height)
+			consider(formatChoice{Selector: f.ID, Score: videoScore(f) + audioScore(f), Size: size, Known: known}, f.Width, f.Height)
 		case hasVideo:
 			videos = append(videos, f)
 		case hasAudio:
@@ -314,13 +336,20 @@ func selectFormat(info mediaInfo, budget int64) (formatChoice, bool) {
 		vs, vk := formatSize(v, info.Duration)
 		for _, a := range audios {
 			as, ak := formatSize(a, info.Duration)
-			consider(formatChoice{Selector: v.ID + "+" + a.ID, Score: videoScore(v) + audioScore(a), Size: vs + as, Known: vk && ak}, v.Height)
+			consider(formatChoice{Selector: v.ID + "+" + a.ID, Score: videoScore(v) + audioScore(a), Size: vs + as, Known: vk && ak}, v.Width, v.Height)
 		}
 	}
 	if haveKnown {
 		return knownBest, true
 	}
 	return unknownBest, haveUnknown
+}
+
+func portraitAware1080p(width, height float64) bool {
+	if width > 0 && height > 0 {
+		return min(width, height) <= 1080
+	}
+	return max(width, height) <= 1920
 }
 
 func formatSize(f mediaFormat, duration float64) (int64, bool) {

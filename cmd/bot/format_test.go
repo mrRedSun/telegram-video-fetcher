@@ -17,8 +17,8 @@ func TestSelectsBestCompatibleSeparateStreams(t *testing.T) {
 
 func TestUnknownSizeUsesConservative1080pFallback(t *testing.T) {
 	info := mediaInfo{Formats: []mediaFormat{
-		{ID: "4k", Ext: "mp4", VideoCodec: "avc1", Height: 2160},
-		{ID: "1080", Ext: "mp4", VideoCodec: "avc1", Height: 1080},
+		{ID: "4k", Ext: "mp4", VideoCodec: "avc1", Width: 2160, Height: 3840},
+		{ID: "1080", Ext: "mp4", VideoCodec: "avc1", Width: 1080, Height: 1920},
 		{ID: "audio", Ext: "m4a", AudioCodec: "mp4a", FormatNote: "original"},
 	}}
 	got, ok := selectFormat(info, 48_000_000)
