@@ -90,6 +90,23 @@ type mediaFormat struct {
 	LanguagePreference  float64 `json:"language_preference"`
 }
 
+type videoMeta struct {
+	Width, Height, Duration int
+}
+
+type probeResult struct {
+	Streams []struct {
+		CodecType         string `json:"codec_type"`
+		CodecName         string `json:"codec_name"`
+		Width             int    `json:"width"`
+		Height            int    `json:"height"`
+		SampleAspectRatio string `json:"sample_aspect_ratio"`
+	} `json:"streams"`
+	Format struct {
+		Duration string `json:"duration"`
+	} `json:"format"`
+}
+
 type formatChoice struct {
 	Selector string
 	Score    float64
@@ -110,6 +127,10 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
+		path, meta, err := prepareTelegramVideo(ctx, dir, path)
+		if err != nil {
+			panic(err)
+		}
 		st, err := os.Stat(path)
 		if err != nil {
 			panic(err)
@@ -117,7 +138,7 @@ func main() {
 		if st.Size() > maxUpload {
 			panic("probe output exceeds upload limit")
 		}
-		slog.Info("probe succeeded", "bytes", st.Size(), "file", filepath.Base(path))
+		slog.Info("probe succeeded", "bytes", st.Size(), "file", filepath.Base(path), "width", meta.Width, "height", meta.Height, "duration", meta.Duration)
 		return
 	}
 	cfg, err := loadConfig()
@@ -229,7 +250,7 @@ func worker(ctx context.Context, cfg config, a *api, c *cache, jobs <-chan job) 
 		if ctx.Err() != nil {
 			return
 		}
-		key := normalize(j.URL)
+		key := "media-v3:" + normalize(j.URL)
 		if id, _ := c.get(key); id != "" {
 			if err := a.sendCached(ctx, j, id); err == nil {
 				continue
@@ -242,10 +263,18 @@ func worker(ctx context.Context, cfg config, a *api, c *cache, jobs <-chan job) 
 			continue
 		}
 		path, err := download(dctx, dir, j.URL)
-		cancel()
 		if err != nil {
+			cancel()
 			slog.Warn("download failed", "error", err, "host", host(j.URL))
 			_ = a.reply(ctx, j.ChatID, j.MessageID, "Could not download this video under the 50 MB limit.")
+			os.RemoveAll(dir)
+			continue
+		}
+		path, meta, err := prepareTelegramVideo(dctx, dir, path)
+		cancel()
+		if err != nil {
+			slog.Warn("media validation failed", "error", err, "host", host(j.URL))
+			_ = a.reply(ctx, j.ChatID, j.MessageID, "Downloaded media could not be prepared as a Telegram-compatible video.")
 			os.RemoveAll(dir)
 			continue
 		}
@@ -255,7 +284,7 @@ func worker(ctx context.Context, cfg config, a *api, c *cache, jobs <-chan job) 
 			os.RemoveAll(dir)
 			continue
 		}
-		fileID, err := a.upload(ctx, j, path)
+		fileID, err := a.upload(ctx, j, path, meta)
 		if err != nil {
 			slog.Error("upload failed", "error", err, "host", host(j.URL))
 			_ = a.reply(ctx, j.ChatID, j.MessageID, "Telegram rejected the downloaded video.")
@@ -270,6 +299,7 @@ func download(ctx context.Context, dir, raw string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	slog.Info("format selected", "selector", selector, "host", host(raw))
 	out := filepath.Join(dir, "video.%(ext)s")
 	cmd := exec.CommandContext(ctx, "yt-dlp", "--no-playlist", "--no-warnings", "--max-filesize", "49M", "--match-filter", "!is_live & duration <=? 3600", "-f", selector, "--merge-output-format", "mp4", "-o", out, "--", raw)
 	var stderr bytes.Buffer
@@ -322,10 +352,14 @@ func selectFormat(info mediaInfo, budget int64) (formatChoice, bool) {
 	for _, f := range info.Formats {
 		hasVideo := f.VideoCodec != "" && f.VideoCodec != "none"
 		hasAudio := f.AudioCodec != "" && f.AudioCodec != "none"
+		opaqueMP4 := f.Ext == "mp4" && !hasVideo && !hasAudio
 		size, known := formatSize(f, info.Duration)
 		switch {
-		case hasVideo && hasAudio:
-			consider(formatChoice{Selector: f.ID, Score: videoScore(f) + audioScore(f), Size: size, Known: known}, f.Width, f.Height)
+		case opaqueMP4 || hasVideo && hasAudio:
+			// Prefer a source-provided progressive file over DASH/HLS reconstruction
+			// when quality is otherwise comparable. It preserves platform framing
+			// and is much more likely to be directly Telegram-compatible.
+			consider(formatChoice{Selector: f.ID, Score: videoScore(f) + audioScore(f) + 6e11, Size: size, Known: known}, f.Width, f.Height)
 		case hasVideo:
 			videos = append(videos, f)
 		case hasAudio:
@@ -388,6 +422,71 @@ func audioScore(f mediaFormat) float64 {
 		score += 1e7
 	}
 	return score
+}
+
+func prepareTelegramVideo(ctx context.Context, dir, input string) (string, videoMeta, error) {
+	before, err := probeVideo(ctx, input)
+	if err != nil {
+		return "", videoMeta{}, err
+	}
+	output := filepath.Join(dir, "telegram.mp4")
+	args := []string{"-y", "-v", "error", "-i", input, "-map", "0:v:0", "-map", "0:a:0?"}
+	if before.videoCodec == "h264" && (before.audioCodec == "" || before.audioCodec == "aac") && (before.sar == "" || before.sar == "1:1") {
+		args = append(args, "-c", "copy")
+	} else {
+		args = append(args, "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p", "-vf", "setsar=1", "-c:a", "aac", "-b:a", "128k")
+	}
+	args = append(args, "-metadata:s:v:0", "rotate=0", "-movflags", "+faststart", output)
+	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", videoMeta{}, fmt.Errorf("ffmpeg normalization: %w: %.300s", err, stderr.String())
+	}
+	after, err := probeVideo(ctx, output)
+	if err != nil {
+		return "", videoMeta{}, err
+	}
+	if after.width < 1 || after.height < 1 || after.duration < 1 {
+		return "", videoMeta{}, errors.New("invalid normalized video geometry or duration")
+	}
+	return output, videoMeta{Width: after.width, Height: after.height, Duration: int(after.duration + 0.5)}, nil
+}
+
+type probedVideo struct {
+	width, height               int
+	duration                    float64
+	videoCodec, audioCodec, sar string
+}
+
+func probeVideo(ctx context.Context, path string) (probedVideo, error) {
+	cmd := exec.CommandContext(ctx, "ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name,width,height,sample_aspect_ratio:format=duration", "-of", "json", path)
+	out, err := cmd.Output()
+	if err != nil {
+		return probedVideo{}, fmt.Errorf("ffprobe: %w", err)
+	}
+	var result probeResult
+	if err := json.Unmarshal(out, &result); err != nil {
+		return probedVideo{}, err
+	}
+	p := probedVideo{}
+	for _, stream := range result.Streams {
+		switch stream.CodecType {
+		case "video":
+			if p.videoCodec == "" {
+				p.videoCodec, p.width, p.height, p.sar = stream.CodecName, stream.Width, stream.Height, stream.SampleAspectRatio
+			}
+		case "audio":
+			if p.audioCodec == "" {
+				p.audioCodec = stream.CodecName
+			}
+		}
+	}
+	p.duration, _ = strconv.ParseFloat(result.Format.Duration, 64)
+	if p.videoCodec == "" {
+		return p, errors.New("no video stream")
+	}
+	return p, nil
 }
 func normalize(raw string) string {
 	u, e := url.Parse(raw)
@@ -457,7 +556,7 @@ func (a *api) reply(ctx context.Context, chat, msg int64, text string) error {
 func (a *api) sendCached(ctx context.Context, j job, id string) error {
 	return a.call(ctx, "sendVideo", map[string]any{"chat_id": j.ChatID, "reply_parameters": map[string]any{"message_id": j.MessageID}, "video": id}, nil)
 }
-func (a *api) upload(ctx context.Context, j job, path string) (string, error) {
+func (a *api) upload(ctx context.Context, j job, path string, meta videoMeta) (string, error) {
 	f, e := os.Open(path)
 	if e != nil {
 		return "", e
@@ -467,6 +566,10 @@ func (a *api) upload(ctx context.Context, j job, path string) (string, error) {
 	w := multipart.NewWriter(&b)
 	_ = w.WriteField("chat_id", strconv.FormatInt(j.ChatID, 10))
 	_ = w.WriteField("reply_parameters", fmt.Sprintf(`{"message_id":%d}`, j.MessageID))
+	_ = w.WriteField("width", strconv.Itoa(meta.Width))
+	_ = w.WriteField("height", strconv.Itoa(meta.Height))
+	_ = w.WriteField("duration", strconv.Itoa(meta.Duration))
+	_ = w.WriteField("supports_streaming", "true")
 	p, e := w.CreateFormFile("video", filepath.Base(path))
 	if e != nil {
 		return "", e

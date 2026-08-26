@@ -36,3 +36,15 @@ func TestCombinedFormatIsSupported(t *testing.T) {
 		t.Fatalf("got %#v, ok=%v", got, ok)
 	}
 }
+
+func TestProgressiveCombinedBeatsUnknownDASHPair(t *testing.T) {
+	info := mediaInfo{Formats: []mediaFormat{
+		{ID: "progressive", Ext: "mp4"},
+		{ID: "dash-video", Ext: "mp4", VideoCodec: "vp9", Width: 720, Height: 1280},
+		{ID: "dash-audio", Ext: "m4a", AudioCodec: "mp4a"},
+	}}
+	got, ok := selectFormat(info, 48_000_000)
+	if !ok || got.Selector != "progressive" {
+		t.Fatalf("got %#v, ok=%v", got, ok)
+	}
+}
