@@ -70,8 +70,9 @@ type tgFile struct {
 }
 
 type mediaInfo struct {
-	Duration float64       `json:"duration"`
-	Formats  []mediaFormat `json:"formats"`
+	Duration  float64       `json:"duration"`
+	Extractor string        `json:"extractor_key"`
+	Formats   []mediaFormat `json:"formats"`
 }
 
 type mediaFormat struct {
@@ -250,7 +251,7 @@ func worker(ctx context.Context, cfg config, a *api, c *cache, jobs <-chan job) 
 		if ctx.Err() != nil {
 			return
 		}
-		key := "media-v3:" + normalize(j.URL)
+		key := "media-v4:" + normalize(j.URL)
 		if id, _ := c.get(key); id != "" {
 			if err := a.sendCached(ctx, j, id); err == nil {
 				continue
@@ -266,7 +267,9 @@ func worker(ctx context.Context, cfg config, a *api, c *cache, jobs <-chan job) 
 		if err != nil {
 			cancel()
 			slog.Warn("download failed", "error", err, "host", host(j.URL))
-			_ = a.reply(ctx, j.ChatID, j.MessageID, "Could not download this video under the 50 MB limit.")
+			if !isUnsupported(err) {
+				_ = a.reply(ctx, j.ChatID, j.MessageID, "Could not download a usable video from this link.")
+			}
 			os.RemoveAll(dir)
 			continue
 		}
@@ -295,13 +298,14 @@ func worker(ctx context.Context, cfg config, a *api, c *cache, jobs <-chan job) 
 	}
 }
 func download(ctx context.Context, dir, raw string) (string, error) {
-	selector, err := chooseFormat(ctx, raw)
+	infoPath := filepath.Join(dir, "media-info.json")
+	selector, err := chooseFormat(ctx, raw, infoPath)
 	if err != nil {
 		return "", err
 	}
 	slog.Info("format selected", "selector", selector, "host", host(raw))
 	out := filepath.Join(dir, "video.%(ext)s")
-	cmd := exec.CommandContext(ctx, "yt-dlp", "--no-playlist", "--no-warnings", "--max-filesize", "49M", "--match-filter", "!is_live & duration <=? 3600", "-f", selector, "--merge-output-format", "mp4", "-o", out, "--", raw)
+	cmd := exec.CommandContext(ctx, "yt-dlp", "--no-warnings", "--max-filesize", "49M", "-f", selector, "--merge-output-format", "mp4", "-o", out, "--load-info-json", infoPath)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -314,7 +318,7 @@ func download(ctx context.Context, dir, raw string) (string, error) {
 	return files[0], nil
 }
 
-func chooseFormat(ctx context.Context, raw string) (string, error) {
+func chooseFormat(ctx context.Context, raw, infoPath string) (string, error) {
 	cmd := exec.CommandContext(ctx, "yt-dlp", "--dump-single-json", "--skip-download", "--no-playlist", "--no-warnings", "--", raw)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -324,6 +328,12 @@ func chooseFormat(ctx context.Context, raw string) (string, error) {
 	var info mediaInfo
 	if err := json.Unmarshal(stdout.Bytes(), &info); err != nil {
 		return "", fmt.Errorf("metadata JSON: %w", err)
+	}
+	if info.Duration > 3600 {
+		return "", errors.New("video exceeds the one-hour duration limit")
+	}
+	if err := os.WriteFile(infoPath, stdout.Bytes(), 0600); err != nil {
+		return "", fmt.Errorf("save metadata snapshot: %w", err)
 	}
 	choice, ok := selectFormat(info, 48_000_000)
 	if !ok {
@@ -359,7 +369,13 @@ func selectFormat(info mediaInfo, budget int64) (formatChoice, bool) {
 			// Prefer a source-provided progressive file over DASH/HLS reconstruction
 			// when quality is otherwise comparable. It preserves platform framing
 			// and is much more likely to be directly Telegram-compatible.
-			consider(formatChoice{Selector: f.ID, Score: videoScore(f) + audioScore(f) + 6e11, Size: size, Known: known}, f.Width, f.Height)
+			bonus := 1e9
+			if opaqueMP4 && strings.EqualFold(info.Extractor, "Instagram") {
+				// Instagram omits codec/geometry metadata for its original
+				// progressive MP4; post-download ffprobe is authoritative.
+				bonus = 1e17
+			}
+			consider(formatChoice{Selector: f.ID, Score: videoScore(f) + audioScore(f) + bonus, Size: size, Known: known}, f.Width, f.Height)
 		case hasVideo:
 			videos = append(videos, f)
 		case hasAudio:
@@ -408,7 +424,19 @@ func videoScore(f mediaFormat) float64 {
 	if f.Ext == "mp4" {
 		compatibility += 5e11
 	}
-	return compatibility + f.Height*1e7 + f.Width*1e4 + f.FPS*1e2 + f.TotalBitrate
+	// Resolution and frame rate define quality. Codec/container compatibility
+	// only breaks ties because incompatible winners are normalized afterward.
+	pixels := f.Width * f.Height
+	if pixels == 0 && f.Height > 0 {
+		pixels = f.Height * f.Height
+	}
+	resolution := pixels * 1e7
+	return resolution + f.FPS*1e8 + compatibility + f.TotalBitrate
+}
+
+func isUnsupported(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "unsupported url") || strings.Contains(message, "no video formats found")
 }
 
 func audioScore(f mediaFormat) float64 {

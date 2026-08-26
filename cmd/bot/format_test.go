@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 func TestSelectsBestCompatibleSeparateStreams(t *testing.T) {
 	info := mediaInfo{Duration: 10, Formats: []mediaFormat{
@@ -38,7 +41,7 @@ func TestCombinedFormatIsSupported(t *testing.T) {
 }
 
 func TestProgressiveCombinedBeatsUnknownDASHPair(t *testing.T) {
-	info := mediaInfo{Formats: []mediaFormat{
+	info := mediaInfo{Extractor: "Instagram", Formats: []mediaFormat{
 		{ID: "progressive", Ext: "mp4"},
 		{ID: "dash-video", Ext: "mp4", VideoCodec: "vp9", Width: 720, Height: 1280},
 		{ID: "dash-audio", Ext: "m4a", AudioCodec: "mp4a"},
@@ -46,5 +49,23 @@ func TestProgressiveCombinedBeatsUnknownDASHPair(t *testing.T) {
 	got, ok := selectFormat(info, 48_000_000)
 	if !ok || got.Selector != "progressive" {
 		t.Fatalf("got %#v, ok=%v", got, ok)
+	}
+}
+
+func TestResolutionBeatsLowQualityCombinedFormat(t *testing.T) {
+	info := mediaInfo{Formats: []mediaFormat{
+		{ID: "combined-360", Ext: "mp4", VideoCodec: "avc1", AudioCodec: "mp4a", Width: 640, Height: 360, FileSize: 4_000_000},
+		{ID: "video-4k", Ext: "mp4", VideoCodec: "av01", Width: 2160, Height: 3840, FileSize: 20_000_000},
+		{ID: "audio", Ext: "m4a", AudioCodec: "mp4a", FileSize: 1_000_000},
+	}}
+	got, ok := selectFormat(info, 48_000_000)
+	if !ok || got.Selector != "video-4k+audio" {
+		t.Fatalf("got %#v, ok=%v", got, ok)
+	}
+}
+
+func TestUnsupportedErrorsAreSilent(t *testing.T) {
+	if !isUnsupported(errors.New("ERROR: Unsupported URL: https://example.com")) {
+		t.Fatal("unsupported URL was not classified")
 	}
 }
