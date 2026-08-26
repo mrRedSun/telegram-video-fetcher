@@ -1,9 +1,6 @@
 package main
 
-import (
-	"errors"
-	"testing"
-)
+import "testing"
 
 func TestSelectsBestCompatibleSeparateStreams(t *testing.T) {
 	info := mediaInfo{Duration: 10, Formats: []mediaFormat{
@@ -61,11 +58,5 @@ func TestResolutionBeatsLowQualityCombinedFormat(t *testing.T) {
 	got, ok := selectFormat(info, 48_000_000)
 	if !ok || got.Selector != "video-4k+audio" {
 		t.Fatalf("got %#v, ok=%v", got, ok)
-	}
-}
-
-func TestUnsupportedErrorsAreSilent(t *testing.T) {
-	if !isUnsupported(errors.New("ERROR: Unsupported URL: https://example.com")) {
-		t.Fatal("unsupported URL was not classified")
 	}
 }

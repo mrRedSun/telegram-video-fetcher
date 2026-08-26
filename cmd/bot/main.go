@@ -221,7 +221,7 @@ func poll(ctx context.Context, cfg config, a *api, jobs chan<- job) {
 				select {
 				case jobs <- job{u.Message.Chat.ID, u.Message.MessageID, raw}:
 				default:
-					_ = a.reply(ctx, u.Message.Chat.ID, u.Message.MessageID, "Download queue is full; please try again shortly.")
+					slog.Warn("download queue full", "host", host(raw))
 				}
 			}
 		}
@@ -267,9 +267,6 @@ func worker(ctx context.Context, cfg config, a *api, c *cache, jobs <-chan job) 
 		if err != nil {
 			cancel()
 			slog.Warn("download failed", "error", err, "host", host(j.URL))
-			if !isUnsupported(err) {
-				_ = a.reply(ctx, j.ChatID, j.MessageID, "Could not download a usable video from this link.")
-			}
 			os.RemoveAll(dir)
 			continue
 		}
@@ -277,20 +274,18 @@ func worker(ctx context.Context, cfg config, a *api, c *cache, jobs <-chan job) 
 		cancel()
 		if err != nil {
 			slog.Warn("media validation failed", "error", err, "host", host(j.URL))
-			_ = a.reply(ctx, j.ChatID, j.MessageID, "Downloaded media could not be prepared as a Telegram-compatible video.")
 			os.RemoveAll(dir)
 			continue
 		}
 		st, err := os.Stat(path)
 		if err != nil || st.Size() > maxUpload {
-			_ = a.reply(ctx, j.ChatID, j.MessageID, "The available video is too large for Telegram's 50 MB bot limit.")
+			slog.Warn("prepared video exceeds upload limit", "host", host(j.URL))
 			os.RemoveAll(dir)
 			continue
 		}
 		fileID, err := a.upload(ctx, j, path, meta)
 		if err != nil {
 			slog.Error("upload failed", "error", err, "host", host(j.URL))
-			_ = a.reply(ctx, j.ChatID, j.MessageID, "Telegram rejected the downloaded video.")
 		} else {
 			_ = c.put(key, fileID)
 		}
@@ -434,11 +429,6 @@ func videoScore(f mediaFormat) float64 {
 	return resolution + f.FPS*1e8 + compatibility + f.TotalBitrate
 }
 
-func isUnsupported(err error) bool {
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "unsupported url") || strings.Contains(message, "no video formats found")
-}
-
 func audioScore(f mediaFormat) float64 {
 	score := f.LanguagePreference*1e6 + f.AudioBitrate
 	note := strings.ToLower(f.FormatNote)
@@ -577,9 +567,6 @@ func (a *api) call(ctx context.Context, method string, payload any, result any) 
 		return json.Unmarshal(r.Result, result)
 	}
 	return nil
-}
-func (a *api) reply(ctx context.Context, chat, msg int64, text string) error {
-	return a.call(ctx, "sendMessage", map[string]any{"chat_id": chat, "reply_parameters": map[string]any{"message_id": msg}, "text": text}, nil)
 }
 func (a *api) sendCached(ctx context.Context, j job, id string) error {
 	return a.call(ctx, "sendVideo", map[string]any{"chat_id": j.ChatID, "reply_parameters": map[string]any{"message_id": j.MessageID}, "video": id}, nil)
