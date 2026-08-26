@@ -69,6 +69,34 @@ type tgFile struct {
 	UniqueID string `json:"file_unique_id"`
 }
 
+type mediaInfo struct {
+	Duration float64       `json:"duration"`
+	Formats  []mediaFormat `json:"formats"`
+}
+
+type mediaFormat struct {
+	ID                  string  `json:"format_id"`
+	Ext                 string  `json:"ext"`
+	VideoCodec          string  `json:"vcodec"`
+	AudioCodec          string  `json:"acodec"`
+	FormatNote          string  `json:"format_note"`
+	Width               float64 `json:"width"`
+	Height              float64 `json:"height"`
+	FPS                 float64 `json:"fps"`
+	TotalBitrate        float64 `json:"tbr"`
+	AudioBitrate        float64 `json:"abr"`
+	FileSize            float64 `json:"filesize"`
+	ApproximateFileSize float64 `json:"filesize_approx"`
+	LanguagePreference  float64 `json:"language_preference"`
+}
+
+type formatChoice struct {
+	Selector string
+	Score    float64
+	Size     int64
+	Known    bool
+}
+
 func main() {
 	cfg, err := loadConfig()
 	if err != nil {
@@ -194,6 +222,7 @@ func worker(ctx context.Context, cfg config, a *api, c *cache, jobs <-chan job) 
 		path, err := download(dctx, dir, j.URL)
 		cancel()
 		if err != nil {
+			slog.Warn("download failed", "error", err, "host", host(j.URL))
 			_ = a.reply(ctx, j.ChatID, j.MessageID, "Could not download this video under the 50 MB limit.")
 			os.RemoveAll(dir)
 			continue
@@ -215,8 +244,12 @@ func worker(ctx context.Context, cfg config, a *api, c *cache, jobs <-chan job) 
 	}
 }
 func download(ctx context.Context, dir, raw string) (string, error) {
+	selector, err := chooseFormat(ctx, raw)
+	if err != nil {
+		return "", err
+	}
 	out := filepath.Join(dir, "video.%(ext)s")
-	cmd := exec.CommandContext(ctx, "yt-dlp", "--no-playlist", "--no-warnings", "--max-filesize", "49M", "--match-filter", "!is_live & duration <=? 3600", "-f", "b[ext=mp4][filesize<49M]/b[filesize<49M]", "-o", out, "--", raw)
+	cmd := exec.CommandContext(ctx, "yt-dlp", "--no-playlist", "--no-warnings", "--max-filesize", "49M", "--match-filter", "!is_live & duration <=? 3600", "-f", selector, "--merge-output-format", "mp4", "-o", out, "--", raw)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -227,6 +260,105 @@ func download(ctx context.Context, dir, raw string) (string, error) {
 		return "", errors.New("no single output")
 	}
 	return files[0], nil
+}
+
+func chooseFormat(ctx context.Context, raw string) (string, error) {
+	cmd := exec.CommandContext(ctx, "yt-dlp", "--dump-single-json", "--skip-download", "--no-playlist", "--no-warnings", "--", raw)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("metadata: %w: %.300s", err, stderr.String())
+	}
+	var info mediaInfo
+	if err := json.Unmarshal(stdout.Bytes(), &info); err != nil {
+		return "", fmt.Errorf("metadata JSON: %w", err)
+	}
+	choice, ok := selectFormat(info, 48_000_000)
+	if !ok {
+		return "", errors.New("no video format fits the size budget")
+	}
+	return choice.Selector, nil
+}
+
+func selectFormat(info mediaInfo, budget int64) (formatChoice, bool) {
+	var knownBest, unknownBest formatChoice
+	var haveKnown, haveUnknown bool
+	consider := func(c formatChoice, height float64) {
+		if c.Known {
+			if c.Size <= budget && (!haveKnown || c.Score > knownBest.Score) {
+				knownBest, haveKnown = c, true
+			}
+			return
+		}
+		// With no trustworthy size, 1080p is the highest conservative fallback.
+		if height <= 1080 && (!haveUnknown || c.Score > unknownBest.Score) {
+			unknownBest, haveUnknown = c, true
+		}
+	}
+
+	var videos, audios []mediaFormat
+	for _, f := range info.Formats {
+		hasVideo := f.VideoCodec != "" && f.VideoCodec != "none"
+		hasAudio := f.AudioCodec != "" && f.AudioCodec != "none"
+		size, known := formatSize(f, info.Duration)
+		switch {
+		case hasVideo && hasAudio:
+			consider(formatChoice{Selector: f.ID, Score: videoScore(f) + audioScore(f), Size: size, Known: known}, f.Height)
+		case hasVideo:
+			videos = append(videos, f)
+		case hasAudio:
+			audios = append(audios, f)
+		}
+	}
+	for _, v := range videos {
+		vs, vk := formatSize(v, info.Duration)
+		for _, a := range audios {
+			as, ak := formatSize(a, info.Duration)
+			consider(formatChoice{Selector: v.ID + "+" + a.ID, Score: videoScore(v) + audioScore(a), Size: vs + as, Known: vk && ak}, v.Height)
+		}
+	}
+	if haveKnown {
+		return knownBest, true
+	}
+	return unknownBest, haveUnknown
+}
+
+func formatSize(f mediaFormat, duration float64) (int64, bool) {
+	if f.FileSize > 0 {
+		return int64(f.FileSize), true
+	}
+	if f.ApproximateFileSize > 0 {
+		return int64(f.ApproximateFileSize), true
+	}
+	if duration > 0 && f.TotalBitrate > 0 {
+		return int64(duration * f.TotalBitrate * 1000 / 8 * 1.08), true
+	}
+	return 0, false
+}
+
+func videoScore(f mediaFormat) float64 {
+	codec := strings.ToLower(f.VideoCodec)
+	compatibility := float64(0)
+	if strings.Contains(codec, "avc") || strings.Contains(codec, "h264") {
+		compatibility += 1e12
+	}
+	if f.Ext == "mp4" {
+		compatibility += 5e11
+	}
+	return compatibility + f.Height*1e7 + f.Width*1e4 + f.FPS*1e2 + f.TotalBitrate
+}
+
+func audioScore(f mediaFormat) float64 {
+	score := f.LanguagePreference*1e6 + f.AudioBitrate
+	note := strings.ToLower(f.FormatNote)
+	if strings.Contains(note, "original") || strings.Contains(note, "default") {
+		score += 1e8
+	}
+	codec := strings.ToLower(f.AudioCodec)
+	if f.Ext == "m4a" || strings.Contains(codec, "mp4a") || strings.Contains(codec, "aac") {
+		score += 1e7
+	}
+	return score
 }
 func normalize(raw string) string {
 	u, e := url.Parse(raw)
