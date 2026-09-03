@@ -30,6 +30,7 @@ import (
 )
 
 const maxUpload = int64(49_000_000)
+const transcodeTarget = int64(47_000_000)
 
 var urlRE = regexp.MustCompile(`https?://[^\s<>]+`)
 
@@ -502,18 +503,43 @@ func prepareTelegramVideo(ctx context.Context, dir, input string) (string, video
 		return "", videoMeta{}, err
 	}
 	output := filepath.Join(dir, "telegram.mp4")
-	args := []string{"-y", "-v", "error", "-i", input, "-map", "0:v:0", "-map", "0:a:0?"}
-	if before.videoCodec == "h264" && (before.audioCodec == "" || before.audioCodec == "aac") && (before.sar == "" || before.sar == "1:1") {
-		args = append(args, "-c", "copy")
-	} else {
-		args = append(args, "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p", "-vf", "setsar=1", "-c:a", "aac", "-b:a", "128k")
+	compatible := before.videoCodec == "h264" && (before.audioCodec == "" || before.audioCodec == "aac") && (before.sar == "" || before.sar == "1:1")
+	inputStat, err := os.Stat(input)
+	if err != nil {
+		return "", videoMeta{}, err
 	}
-	args = append(args, "-metadata:s:v:0", "rotate=0", "-movflags", "+faststart", output)
-	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return "", videoMeta{}, fmt.Errorf("ffmpeg normalization: %w: %.300s", err, stderr.String())
+	// Large AV1/VP9 sources are likely to grow past the limit when normalized to
+	// H.264. Go directly to the bounded encode instead of creating a doomed CRF
+	// intermediate first.
+	if !compatible && inputStat.Size() > transcodeTarget/2 {
+		output, err = transcodeToSize(ctx, dir, input, before)
+	} else {
+		args := []string{"-y", "-v", "error", "-i", input, "-map", "0:v:0", "-map", "0:a:0?"}
+		if compatible {
+			args = append(args, "-c", "copy")
+		} else {
+			args = append(args, "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p", "-vf", "setsar=1", "-c:a", "aac", "-b:a", "128k")
+		}
+		args = append(args, "-metadata:s:v:0", "rotate=0", "-movflags", "+faststart", output)
+		err = runFFmpeg(ctx, "ffmpeg normalization", args)
+	}
+	if err != nil {
+		return "", videoMeta{}, err
+	}
+	st, err := os.Stat(output)
+	if err != nil {
+		return "", videoMeta{}, err
+	}
+	if st.Size() > maxUpload {
+		// The temporary filesystem is deliberately small. Remove the disposable
+		// oversized encode before producing its size-constrained replacement.
+		if err := os.Remove(output); err != nil {
+			return "", videoMeta{}, fmt.Errorf("remove oversized intermediate: %w", err)
+		}
+		output, err = transcodeToSize(ctx, dir, input, before)
+		if err != nil {
+			return "", videoMeta{}, err
+		}
 	}
 	after, err := probeVideo(ctx, output)
 	if err != nil {
@@ -522,7 +548,71 @@ func prepareTelegramVideo(ctx context.Context, dir, input string) (string, video
 	if after.width < 1 || after.height < 1 || after.duration < 1 {
 		return "", videoMeta{}, errors.New("invalid normalized video geometry or duration")
 	}
+	st, err = os.Stat(output)
+	if err != nil {
+		return "", videoMeta{}, err
+	}
+	if st.Size() > maxUpload {
+		return "", videoMeta{}, errors.New("size-targeted video exceeds upload limit")
+	}
 	return output, videoMeta{Width: after.width, Height: after.height, Duration: int(after.duration + 0.5)}, nil
+}
+
+func transcodeToSize(ctx context.Context, dir, input string, media probedVideo) (string, error) {
+	videoRate, audioRate, err := transcodeBitrates(media.duration, media.audioCodec != "")
+	if err != nil {
+		return "", err
+	}
+	output := filepath.Join(dir, "telegram-sized.mp4")
+	passlog := filepath.Join(dir, "ffmpeg-pass")
+	videoArgs := []string{
+		"-c:v", "libx264", "-preset", "veryfast", "-b:v", strconv.FormatInt(videoRate, 10),
+		"-pix_fmt", "yuv420p", "-vf", "setsar=1", "-passlogfile", passlog,
+	}
+	firstPass := append([]string{"-y", "-v", "error", "-i", input, "-map", "0:v:0"}, videoArgs...)
+	firstPass = append(firstPass, "-pass", "1", "-an", "-f", "null", os.DevNull)
+	if err := runFFmpeg(ctx, "ffmpeg size pass 1", firstPass); err != nil {
+		return "", err
+	}
+	secondPass := append([]string{"-y", "-v", "error", "-i", input, "-map", "0:v:0", "-map", "0:a:0?"}, videoArgs...)
+	secondPass = append(secondPass, "-pass", "2")
+	if media.audioCodec != "" {
+		secondPass = append(secondPass, "-c:a", "aac", "-b:a", strconv.FormatInt(audioRate, 10))
+	}
+	secondPass = append(secondPass, "-metadata:s:v:0", "rotate=0", "-movflags", "+faststart", output)
+	if err := runFFmpeg(ctx, "ffmpeg size pass 2", secondPass); err != nil {
+		return "", err
+	}
+	return output, nil
+}
+
+func transcodeBitrates(duration float64, hasAudio bool) (int64, int64, error) {
+	if duration <= 0 {
+		return 0, 0, errors.New("cannot size transcode without duration")
+	}
+	// Reserve two percent for MP4 container overhead. Keep audio at 128 kbps
+	// when possible, but reduce it for long videos so video retains most of the
+	// fixed Telegram upload budget.
+	totalRate := int64(float64(transcodeTarget*8) / duration * 0.98)
+	audioRate := int64(0)
+	if hasAudio {
+		audioRate = min(int64(128_000), max(int64(32_000), totalRate/6))
+	}
+	videoRate := totalRate - audioRate
+	if videoRate < 50_000 {
+		return 0, 0, errors.New("video is too long for the upload size budget")
+	}
+	return videoRate, audioRate, nil
+}
+
+func runFFmpeg(ctx context.Context, label string, args []string) error {
+	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%s: %w: %.300s", label, err, stderr.String())
+	}
+	return nil
 }
 
 type probedVideo struct {

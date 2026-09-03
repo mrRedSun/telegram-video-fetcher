@@ -60,3 +60,27 @@ func TestResolutionBeatsLowQualityCombinedFormat(t *testing.T) {
 		t.Fatalf("got %#v, ok=%v", got, ok)
 	}
 }
+
+func TestTranscodeBitratesFitTarget(t *testing.T) {
+	video, audio, err := transcodeBitrates(110.333, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if audio != 128_000 {
+		t.Fatalf("audio bitrate = %d, want 128000", audio)
+	}
+	projected := float64(video+audio) * 110.333 / 8
+	if projected >= float64(transcodeTarget) || projected < 45_000_000 {
+		t.Fatalf("projected output = %.0f bytes", projected)
+	}
+}
+
+func TestTranscodeBitratesReduceAudioForLongVideo(t *testing.T) {
+	video, audio, err := transcodeBitrates(3600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if video < 50_000 || audio != 32_000 {
+		t.Fatalf("video=%d audio=%d", video, audio)
+	}
+}
