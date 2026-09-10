@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestSelectsBestCompatibleSeparateStreams(t *testing.T) {
 	info := mediaInfo{Duration: 10, Formats: []mediaFormat{
@@ -82,5 +85,48 @@ func TestTranscodeBitratesReduceAudioForLongVideo(t *testing.T) {
 	}
 	if video < 50_000 || audio != 32_000 {
 		t.Fatalf("video=%d audio=%d", video, audio)
+	}
+}
+
+func TestPlansEveryVideoInMultiVideoPost(t *testing.T) {
+	entry := func(id string) json.RawMessage {
+		raw, err := json.Marshal(mediaInfo{Duration: 5, Formats: []mediaFormat{{ID: id, Ext: "mp4", VideoCodec: "avc1", AudioCodec: "aac", Width: 1920, Height: 1080, FileSize: 2_000_000}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	raw, err := json.Marshal(mediaInfo{Entries: []json.RawMessage{entry("first"), entry("second")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plans, err := plansFromMetadata(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plans) != 2 || plans[0].Selector != "first" || plans[1].Selector != "second" {
+		t.Fatalf("unexpected plans: %#v", plans)
+	}
+}
+
+func TestMultiVideoPostIsCappedAtFiveItems(t *testing.T) {
+	entries := make([]json.RawMessage, 0, 7)
+	for i := 0; i < 7; i++ {
+		raw, err := json.Marshal(mediaInfo{Duration: 5, Formats: []mediaFormat{{ID: "video", Ext: "mp4", VideoCodec: "avc1", AudioCodec: "aac", FileSize: 1_000_000}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries = append(entries, raw)
+	}
+	raw, err := json.Marshal(mediaInfo{Entries: entries})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plans, err := plansFromMetadata(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plans) != maxVideosPerPost {
+		t.Fatalf("got %d plans, want %d", len(plans), maxVideosPerPost)
 	}
 }

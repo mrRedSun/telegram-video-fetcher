@@ -31,6 +31,7 @@ import (
 
 const maxUpload = int64(49_000_000)
 const transcodeTarget = int64(47_000_000)
+const maxVideosPerPost = 5
 
 var urlRE = regexp.MustCompile(`https?://[^\s<>]+`)
 
@@ -92,9 +93,10 @@ type tgFile struct {
 }
 
 type mediaInfo struct {
-	Duration  float64       `json:"duration"`
-	Extractor string        `json:"extractor_key"`
-	Formats   []mediaFormat `json:"formats"`
+	Duration  float64           `json:"duration"`
+	Extractor string            `json:"extractor_key"`
+	Formats   []mediaFormat     `json:"formats"`
+	Entries   []json.RawMessage `json:"entries"`
 }
 
 type mediaFormat struct {
@@ -115,6 +117,16 @@ type mediaFormat struct {
 
 type videoMeta struct {
 	Width, Height, Duration int
+}
+
+type downloadPlan struct {
+	Info     json.RawMessage
+	Selector string
+}
+
+type preparedVideo struct {
+	Path string
+	Meta videoMeta
 }
 
 type probeResult struct {
@@ -146,22 +158,24 @@ func main() {
 			panic(err)
 		}
 		defer os.RemoveAll(dir)
-		path, err := download(ctx, dir, probe)
+		paths, err := download(ctx, dir, probe)
 		if err != nil {
 			panic(err)
 		}
-		path, meta, err := prepareTelegramVideo(ctx, dir, path)
-		if err != nil {
-			panic(err)
+		for i, path := range paths {
+			path, meta, err := prepareTelegramVideo(ctx, filepath.Dir(path), path)
+			if err != nil {
+				panic(err)
+			}
+			st, err := os.Stat(path)
+			if err != nil {
+				panic(err)
+			}
+			if st.Size() > maxUpload {
+				panic("probe output exceeds upload limit")
+			}
+			slog.Info("probe item succeeded", "item", i+1, "items", len(paths), "bytes", st.Size(), "file", filepath.Base(path), "width", meta.Width, "height", meta.Height, "duration", meta.Duration)
 		}
-		st, err := os.Stat(path)
-		if err != nil {
-			panic(err)
-		}
-		if st.Size() > maxUpload {
-			panic("probe output exceeds upload limit")
-		}
-		slog.Info("probe succeeded", "bytes", st.Size(), "file", filepath.Base(path), "width", meta.Width, "height", meta.Height, "duration", meta.Duration)
 		return
 	}
 	cfg, err := loadConfig()
@@ -300,8 +314,8 @@ func worker(ctx context.Context, cfg config, a *api, c *cache, jobs <-chan job) 
 			return
 		}
 		key := "media-v4:" + normalize(j.URL)
-		if id, _ := c.get(key); id != "" {
-			if err := a.sendCached(ctx, j, id); err == nil {
+		if ids, _ := c.getFileIDs(key); len(ids) > 0 {
+			if err := a.sendCached(ctx, j, ids); err == nil {
 				_ = c.recordOutcome(true, true)
 				continue
 			}
@@ -313,7 +327,7 @@ func worker(ctx context.Context, cfg config, a *api, c *cache, jobs <-chan job) 
 			_ = c.recordOutcome(false, false)
 			continue
 		}
-		path, err := download(dctx, dir, j.URL)
+		paths, err := download(dctx, dir, j.URL)
 		if err != nil {
 			cancel()
 			slog.Warn("download failed", "error", err, "host", host(j.URL))
@@ -321,7 +335,23 @@ func worker(ctx context.Context, cfg config, a *api, c *cache, jobs <-chan job) 
 			os.RemoveAll(dir)
 			continue
 		}
-		path, meta, err := prepareTelegramVideo(dctx, dir, path)
+		prepared := make([]preparedVideo, 0, len(paths))
+		for _, source := range paths {
+			path, meta, prepareErr := prepareTelegramVideo(dctx, filepath.Dir(source), source)
+			if prepareErr != nil {
+				err = prepareErr
+				break
+			}
+			st, statErr := os.Stat(path)
+			if statErr != nil || st.Size() > maxUpload {
+				err = errors.New("prepared video exceeds upload limit")
+				break
+			}
+			if path != source {
+				_ = os.Remove(source)
+			}
+			prepared = append(prepared, preparedVideo{Path: path, Meta: meta})
+		}
 		cancel()
 		if err != nil {
 			slog.Warn("media validation failed", "error", err, "host", host(j.URL))
@@ -329,67 +359,96 @@ func worker(ctx context.Context, cfg config, a *api, c *cache, jobs <-chan job) 
 			os.RemoveAll(dir)
 			continue
 		}
-		st, err := os.Stat(path)
-		if err != nil || st.Size() > maxUpload {
-			slog.Warn("prepared video exceeds upload limit", "host", host(j.URL))
-			_ = c.recordOutcome(false, false)
-			os.RemoveAll(dir)
-			continue
-		}
-		fileID, err := a.upload(ctx, j, path, meta)
+		fileIDs, err := a.upload(ctx, j, prepared)
 		if err != nil {
 			slog.Error("upload failed", "error", err, "host", host(j.URL))
 			_ = c.recordOutcome(false, false)
 		} else {
-			_ = c.put(key, fileID)
+			_ = c.putFileIDs(key, fileIDs)
 			_ = c.recordOutcome(true, false)
 		}
 		os.RemoveAll(dir)
 	}
 }
-func download(ctx context.Context, dir, raw string) (string, error) {
-	infoPath := filepath.Join(dir, "media-info.json")
-	selector, err := chooseFormat(ctx, raw, infoPath)
+func download(ctx context.Context, dir, raw string) ([]string, error) {
+	plans, err := chooseFormats(ctx, raw)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	slog.Info("format selected", "selector", selector, "host", host(raw))
-	out := filepath.Join(dir, "video.%(ext)s")
-	cmd := exec.CommandContext(ctx, "yt-dlp", "--no-warnings", "--max-filesize", "49M", "-f", selector, "--merge-output-format", "mp4", "-o", out, "--load-info-json", infoPath)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("yt-dlp: %w: %.300s", err, stderr.String())
+	paths := make([]string, 0, len(plans))
+	for i, plan := range plans {
+		itemDir := dir
+		if len(plans) > 1 {
+			itemDir = filepath.Join(dir, fmt.Sprintf("item-%d", i+1))
+			if err := os.Mkdir(itemDir, 0700); err != nil {
+				return nil, err
+			}
+		}
+		infoPath := filepath.Join(itemDir, "media-info.json")
+		if err := os.WriteFile(infoPath, plan.Info, 0600); err != nil {
+			return nil, fmt.Errorf("save metadata snapshot: %w", err)
+		}
+		slog.Info("format selected", "selector", plan.Selector, "item", i+1, "items", len(plans), "host", host(raw))
+		out := filepath.Join(itemDir, "video.%(ext)s")
+		cmd := exec.CommandContext(ctx, "yt-dlp", "--no-warnings", "--max-filesize", "49M", "-f", plan.Selector, "--merge-output-format", "mp4", "-o", out, "--load-info-json", infoPath)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			return nil, fmt.Errorf("yt-dlp item %d: %w: %.300s", i+1, err, stderr.String())
+		}
+		files, _ := filepath.Glob(filepath.Join(itemDir, "video.*"))
+		if len(files) != 1 {
+			return nil, fmt.Errorf("item %d produced no single output", i+1)
+		}
+		paths = append(paths, files[0])
 	}
-	files, _ := filepath.Glob(filepath.Join(dir, "video.*"))
-	if len(files) != 1 {
-		return "", errors.New("no single output")
-	}
-	return files[0], nil
+	return paths, nil
 }
 
-func chooseFormat(ctx context.Context, raw, infoPath string) (string, error) {
-	cmd := exec.CommandContext(ctx, "yt-dlp", "--dump-single-json", "--skip-download", "--no-playlist", "--no-warnings", "--", raw)
+func chooseFormats(ctx context.Context, raw string) ([]downloadPlan, error) {
+	cmd := exec.CommandContext(ctx, "yt-dlp", "--dump-single-json", "--skip-download", "--no-playlist", "--playlist-end", strconv.Itoa(maxVideosPerPost), "--no-warnings", "--", raw)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("metadata: %w: %.300s", err, stderr.String())
+		return nil, fmt.Errorf("metadata: %w: %.300s", err, stderr.String())
 	}
+	return plansFromMetadata(stdout.Bytes())
+}
+
+func plansFromMetadata(raw []byte) ([]downloadPlan, error) {
 	var info mediaInfo
-	if err := json.Unmarshal(stdout.Bytes(), &info); err != nil {
-		return "", fmt.Errorf("metadata JSON: %w", err)
+	if err := json.Unmarshal(raw, &info); err != nil {
+		return nil, fmt.Errorf("metadata JSON: %w", err)
 	}
-	if info.Duration > 3600 {
-		return "", errors.New("video exceeds the one-hour duration limit")
+	items := []json.RawMessage{json.RawMessage(raw)}
+	if len(info.Entries) > 0 {
+		items = info.Entries
+		if len(items) > maxVideosPerPost {
+			items = items[:maxVideosPerPost]
+		}
 	}
-	if err := os.WriteFile(infoPath, stdout.Bytes(), 0600); err != nil {
-		return "", fmt.Errorf("save metadata snapshot: %w", err)
+	plans := make([]downloadPlan, 0, len(items))
+	for i, rawInfo := range items {
+		if len(rawInfo) == 0 || string(rawInfo) == "null" {
+			return nil, fmt.Errorf("playlist item %d has no metadata", i+1)
+		}
+		var item mediaInfo
+		if err := json.Unmarshal(rawInfo, &item); err != nil {
+			return nil, fmt.Errorf("metadata JSON item %d: %w", i+1, err)
+		}
+		if item.Duration > 3600 {
+			return nil, fmt.Errorf("video item %d exceeds the one-hour duration limit", i+1)
+		}
+		choice, ok := selectFormat(item, 48_000_000)
+		if !ok {
+			return nil, fmt.Errorf("no video format fits the size budget for item %d", i+1)
+		}
+		plans = append(plans, downloadPlan{Info: append(json.RawMessage(nil), rawInfo...), Selector: choice.Selector})
 	}
-	choice, ok := selectFormat(info, 48_000_000)
-	if !ok {
-		return "", errors.New("no video format fits the size budget")
+	if len(plans) == 0 {
+		return nil, errors.New("post has no downloadable videos")
 	}
-	return choice.Selector, nil
+	return plans, nil
 }
 
 func selectFormat(info mediaInfo, budget int64) (formatChoice, bool) {
@@ -804,6 +863,32 @@ func (c *cache) put(k, v string) error {
 	return c.db.Update(func(tx *bolt.Tx) error { return tx.Bucket([]byte("files")).Put([]byte(k), []byte(v)) })
 }
 
+func (c *cache) getFileIDs(k string) ([]string, error) {
+	raw, err := c.get(k)
+	if err != nil || raw == "" {
+		return nil, err
+	}
+	if !strings.HasPrefix(raw, "[") {
+		return []string{raw}, nil
+	}
+	var ids []string
+	if err := json.Unmarshal([]byte(raw), &ids); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+func (c *cache) putFileIDs(k string, ids []string) error {
+	if len(ids) == 1 {
+		return c.put(k, ids[0])
+	}
+	raw, err := json.Marshal(ids)
+	if err != nil {
+		return err
+	}
+	return c.put(k, string(raw))
+}
+
 func (a *api) call(ctx context.Context, method string, payload any, result any) error {
 	body, _ := json.Marshal(payload)
 	req, e := http.NewRequestWithContext(ctx, "POST", a.base+"/"+method, bytes.NewReader(body))
@@ -829,11 +914,30 @@ func (a *api) call(ctx context.Context, method string, payload any, result any) 
 	}
 	return nil
 }
-func (a *api) sendCached(ctx context.Context, j job, id string) error {
-	return a.call(ctx, "sendVideo", map[string]any{"chat_id": j.ChatID, "reply_parameters": map[string]any{"message_id": j.MessageID}, "video": id}, nil)
+func (a *api) sendCached(ctx context.Context, j job, ids []string) error {
+	if len(ids) == 1 {
+		return a.call(ctx, "sendVideo", map[string]any{"chat_id": j.ChatID, "reply_parameters": map[string]any{"message_id": j.MessageID}, "video": ids[0]}, nil)
+	}
+	media := make([]map[string]any, 0, len(ids))
+	for _, id := range ids {
+		media = append(media, map[string]any{"type": "video", "media": id, "supports_streaming": true})
+	}
+	return a.call(ctx, "sendMediaGroup", map[string]any{"chat_id": j.ChatID, "reply_parameters": map[string]any{"message_id": j.MessageID}, "media": media}, nil)
 }
-func (a *api) upload(ctx context.Context, j job, path string, meta videoMeta) (string, error) {
-	f, e := os.Open(path)
+
+func (a *api) upload(ctx context.Context, j job, videos []preparedVideo) ([]string, error) {
+	if len(videos) == 1 {
+		id, err := a.uploadOne(ctx, j, videos[0])
+		if err != nil {
+			return nil, err
+		}
+		return []string{id}, nil
+	}
+	return a.uploadAlbum(ctx, j, videos)
+}
+
+func (a *api) uploadOne(ctx context.Context, j job, video preparedVideo) (string, error) {
+	f, e := os.Open(video.Path)
 	if e != nil {
 		return "", e
 	}
@@ -842,11 +946,11 @@ func (a *api) upload(ctx context.Context, j job, path string, meta videoMeta) (s
 	w := multipart.NewWriter(&b)
 	_ = w.WriteField("chat_id", strconv.FormatInt(j.ChatID, 10))
 	_ = w.WriteField("reply_parameters", fmt.Sprintf(`{"message_id":%d}`, j.MessageID))
-	_ = w.WriteField("width", strconv.Itoa(meta.Width))
-	_ = w.WriteField("height", strconv.Itoa(meta.Height))
-	_ = w.WriteField("duration", strconv.Itoa(meta.Duration))
+	_ = w.WriteField("width", strconv.Itoa(video.Meta.Width))
+	_ = w.WriteField("height", strconv.Itoa(video.Meta.Height))
+	_ = w.WriteField("duration", strconv.Itoa(video.Meta.Duration))
 	_ = w.WriteField("supports_streaming", "true")
-	p, e := w.CreateFormFile("video", filepath.Base(path))
+	p, e := w.CreateFormFile("video", filepath.Base(video.Path))
 	if e != nil {
 		return "", e
 	}
@@ -877,4 +981,84 @@ func (a *api) upload(ctx context.Context, j job, path string, meta videoMeta) (s
 		return "", errors.New("missing video file_id")
 	}
 	return sent.Video.FileID, nil
+}
+
+func (a *api) uploadAlbum(ctx context.Context, j job, videos []preparedVideo) ([]string, error) {
+	if len(videos) < 2 || len(videos) > maxVideosPerPost {
+		return nil, fmt.Errorf("invalid album size %d", len(videos))
+	}
+	var b bytes.Buffer
+	w := multipart.NewWriter(&b)
+	_ = w.WriteField("chat_id", strconv.FormatInt(j.ChatID, 10))
+	_ = w.WriteField("reply_parameters", fmt.Sprintf(`{"message_id":%d}`, j.MessageID))
+	media := make([]map[string]any, 0, len(videos))
+	for i, video := range videos {
+		name := fmt.Sprintf("video%d", i)
+		media = append(media, map[string]any{
+			"type":               "video",
+			"media":              "attach://" + name,
+			"width":              video.Meta.Width,
+			"height":             video.Meta.Height,
+			"duration":           video.Meta.Duration,
+			"supports_streaming": true,
+		})
+		f, err := os.Open(video.Path)
+		if err != nil {
+			return nil, err
+		}
+		part, err := w.CreateFormFile(name, filepath.Base(video.Path))
+		if err == nil {
+			_, err = io.Copy(part, f)
+		}
+		closeErr := f.Close()
+		if err != nil {
+			return nil, err
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+	}
+	mediaJSON, err := json.Marshal(media)
+	if err != nil {
+		return nil, err
+	}
+	if err := w.WriteField("media", string(mediaJSON)); err != nil {
+		return nil, err
+	}
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", a.base+"/sendMediaGroup", &b)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	var response tgResponse
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return nil, err
+	}
+	if !response.OK {
+		return nil, errors.New(response.Description)
+	}
+	var sent []sentMessage
+	if err := json.Unmarshal(response.Result, &sent); err != nil {
+		return nil, err
+	}
+	if len(sent) != len(videos) {
+		return nil, errors.New("Telegram returned an incomplete media group")
+	}
+	ids := make([]string, 0, len(sent))
+	for _, message := range sent {
+		if message.Video == nil || message.Video.FileID == "" {
+			return nil, errors.New("missing video file_id in media group")
+		}
+		ids = append(ids, message.Video.FileID)
+	}
+	return ids, nil
 }

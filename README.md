@@ -5,13 +5,18 @@ A small Go Telegram bot that replies to messages containing video-page URLs. It 
 ## Behavior
 
 - Handles up to five HTTP(S) URLs per message in groups and direct messages.
-- Supports individual public pages handled by `yt-dlp`; playlists and live streams are rejected.
+- Supports public pages handled by `yt-dlp`; multi-video posts return up to five
+  videos together as one Telegram media album. General playlists and live
+  streams remain rejected.
 - Selects the highest-quality source estimated to fit, normalizes it for Telegram,
   and uses a duration-aware size-targeted transcode if the prepared file would
   otherwise exceed 49 MB. Media longer than one hour is rejected when duration
   is known.
-- Uses three bounded workers and a 64-item queue.
-- Stores only a BoltDB URL-to-`file_id` cache. Downloads use a 256 MB RAM-backed temporary filesystem and are removed after every attempt.
+- Uses two bounded workers and a 64-item queue, allowing two albums to be
+  processed concurrently within the container's memory limit.
+- Stores only a BoltDB URL-to-`file_id` cache, including ordered file-ID lists
+  for albums. Downloads use a 768 MB RAM-backed temporary filesystem and are
+  removed after every attempt.
 - Access is unrestricted. Do not add the bot to groups where unrestricted downloading is undesirable.
 
 ## Telegram setup

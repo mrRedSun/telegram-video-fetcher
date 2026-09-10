@@ -1,20 +1,20 @@
 services:
   bot:
     image: ghcr.io/mrredsun/telegram-video-fetcher:main
-    restart: unless-stopped
+    restart: always
     init: true
     env_file: .env
     environment:
       DATA_DIR: /data
       TEMP_DIR: /tmp/downloads
-      WORKERS: "3"
+      WORKERS: "2"
       QUEUE_SIZE: "64"
       MAX_URLS_PER_MESSAGE: "5"
-      DOWNLOAD_TIMEOUT_SECONDS: "600"
+      DOWNLOAD_TIMEOUT_SECONDS: "1800"
     volumes:
       - bot-data:/data
     tmpfs:
-      - /tmp/downloads:size=256m,mode=0700,uid=10001,gid=10001
+      - /tmp/downloads:size=768m,mode=0700,uid=10001,gid=10001
     security_opt:
       - no-new-privileges:true
 
