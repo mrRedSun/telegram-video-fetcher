@@ -62,6 +62,7 @@ type message struct {
 }
 type job struct {
 	ChatID, MessageID int64
+	ChatType          string
 	URL               string
 }
 type cache struct {
@@ -280,7 +281,7 @@ func poll(ctx context.Context, cfg config, a *api, c *cache, jobs chan<- job) {
 			}
 			for _, raw := range urls {
 				select {
-				case jobs <- job{u.Message.Chat.ID, u.Message.MessageID, raw}:
+				case jobs <- job{ChatID: u.Message.Chat.ID, MessageID: u.Message.MessageID, ChatType: u.Message.Chat.Type, URL: raw}:
 				default:
 					slog.Warn("download queue full", "host", host(raw))
 					_ = c.recordOutcome(false, false)
@@ -313,62 +314,70 @@ func worker(ctx context.Context, cfg config, a *api, c *cache, jobs <-chan job) 
 		if ctx.Err() != nil {
 			return
 		}
-		key := "media-v4:" + normalize(j.URL)
-		if ids, _ := c.getFileIDs(key); len(ids) > 0 {
-			if err := a.sendCached(ctx, j, ids); err == nil {
-				_ = c.recordOutcome(true, true)
-				continue
-			}
-		}
-		dctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
-		dir, err := os.MkdirTemp(cfg.TempDir, "job-")
-		if err != nil {
-			cancel()
-			_ = c.recordOutcome(false, false)
-			continue
-		}
-		paths, err := download(dctx, dir, j.URL)
-		if err != nil {
-			cancel()
-			slog.Warn("download failed", "error", err, "host", host(j.URL))
-			_ = c.recordOutcome(false, false)
-			os.RemoveAll(dir)
-			continue
-		}
-		prepared := make([]preparedVideo, 0, len(paths))
-		for _, source := range paths {
-			path, meta, prepareErr := prepareTelegramVideo(dctx, filepath.Dir(source), source)
-			if prepareErr != nil {
-				err = prepareErr
-				break
-			}
-			st, statErr := os.Stat(path)
-			if statErr != nil || st.Size() > maxUpload {
-				err = errors.New("prepared video exceeds upload limit")
-				break
-			}
-			if path != source {
-				_ = os.Remove(source)
-			}
-			prepared = append(prepared, preparedVideo{Path: path, Meta: meta})
-		}
-		cancel()
-		if err != nil {
-			slog.Warn("media validation failed", "error", err, "host", host(j.URL))
-			_ = c.recordOutcome(false, false)
-			os.RemoveAll(dir)
-			continue
-		}
-		fileIDs, err := a.upload(ctx, j, prepared)
-		if err != nil {
-			slog.Error("upload failed", "error", err, "host", host(j.URL))
-			_ = c.recordOutcome(false, false)
-		} else {
-			_ = c.putFileIDs(key, fileIDs)
-			_ = c.recordOutcome(true, false)
-		}
-		os.RemoveAll(dir)
+		processJob(ctx, cfg, a, c, j)
 	}
+}
+
+func processJob(ctx context.Context, cfg config, a *api, c *cache, j job) {
+	key := "media-v4:" + normalize(j.URL)
+	if ids, _ := c.getFileIDs(key); len(ids) > 0 {
+		if err := a.sendCached(ctx, j, ids); err == nil {
+			_ = c.recordOutcome(true, true)
+			return
+		}
+	}
+
+	progressCtx, stopProgress := context.WithCancel(ctx)
+	defer stopProgress()
+	if j.ChatType == "group" || j.ChatType == "supergroup" {
+		go a.keepVideoProgress(progressCtx, j.ChatID)
+	}
+
+	dctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
+	defer cancel()
+	dir, err := os.MkdirTemp(cfg.TempDir, "job-")
+	if err != nil {
+		_ = c.recordOutcome(false, false)
+		return
+	}
+	defer os.RemoveAll(dir)
+	paths, err := download(dctx, dir, j.URL)
+	if err != nil {
+		slog.Warn("download failed", "error", err, "host", host(j.URL))
+		_ = c.recordOutcome(false, false)
+		return
+	}
+	prepared := make([]preparedVideo, 0, len(paths))
+	for _, source := range paths {
+		path, meta, prepareErr := prepareTelegramVideo(dctx, filepath.Dir(source), source)
+		if prepareErr != nil {
+			err = prepareErr
+			break
+		}
+		st, statErr := os.Stat(path)
+		if statErr != nil || st.Size() > maxUpload {
+			err = errors.New("prepared video exceeds upload limit")
+			break
+		}
+		if path != source {
+			_ = os.Remove(source)
+		}
+		prepared = append(prepared, preparedVideo{Path: path, Meta: meta})
+	}
+	cancel()
+	if err != nil {
+		slog.Warn("media validation failed", "error", err, "host", host(j.URL))
+		_ = c.recordOutcome(false, false)
+		return
+	}
+	fileIDs, err := a.upload(ctx, j, prepared)
+	if err != nil {
+		slog.Error("upload failed", "error", err, "host", host(j.URL))
+		_ = c.recordOutcome(false, false)
+		return
+	}
+	_ = c.putFileIDs(key, fileIDs)
+	_ = c.recordOutcome(true, false)
 }
 func download(ctx context.Context, dir, raw string) ([]string, error) {
 	plans, err := chooseFormats(ctx, raw)
@@ -914,6 +923,20 @@ func (a *api) call(ctx context.Context, method string, payload any, result any) 
 	}
 	return nil
 }
+
+func (a *api) keepVideoProgress(ctx context.Context, chatID int64) {
+	ticker := time.NewTicker(4 * time.Second)
+	defer ticker.Stop()
+	for {
+		_ = a.call(ctx, "sendChatAction", map[string]any{"chat_id": chatID, "action": "upload_video"}, nil)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 func (a *api) sendCached(ctx context.Context, j job, ids []string) error {
 	if len(ids) == 1 {
 		return a.call(ctx, "sendVideo", map[string]any{"chat_id": j.ChatID, "reply_parameters": map[string]any{"message_id": j.MessageID}, "video": ids[0]}, nil)
