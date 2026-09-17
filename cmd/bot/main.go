@@ -329,7 +329,12 @@ func processJob(ctx context.Context, cfg config, a *api, c *cache, j job) {
 
 	progressCtx, stopProgress := context.WithCancel(ctx)
 	defer stopProgress()
+	reactionSet := false
+	delivered := false
 	if j.ChatType == "group" || j.ChatType == "supergroup" {
+		if err := a.setMessageReaction(progressCtx, j.ChatID, j.MessageID, "👀"); err == nil {
+			reactionSet = true
+		}
 		// Send the first action synchronously so fast jobs cannot finish and
 		// cancel the context before Telegram receives any visible indication.
 		if err := a.sendVideoProgress(progressCtx, j.ChatID); err != nil {
@@ -337,6 +342,20 @@ func processJob(ctx context.Context, cfg config, a *api, c *cache, j job) {
 		}
 		go a.keepVideoProgress(progressCtx, j.ChatID)
 	}
+	defer func() {
+		if !reactionSet {
+			return
+		}
+		if !delivered {
+			_ = a.setMessageReaction(ctx, j.ChatID, j.MessageID, "")
+			return
+		}
+		if err := a.setMessageReaction(ctx, j.ChatID, j.MessageID, "👍"); err != nil {
+			_ = a.setMessageReaction(ctx, j.ChatID, j.MessageID, "")
+			return
+		}
+		go a.clearReactionAfter(ctx, j.ChatID, j.MessageID, 5*time.Second)
+	}()
 
 	dctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
 	defer cancel()
@@ -383,6 +402,7 @@ func processJob(ctx context.Context, cfg config, a *api, c *cache, j job) {
 	}
 	_ = c.putFileIDs(key, fileIDs)
 	_ = c.recordOutcome(true, false)
+	delivered = true
 }
 func download(ctx context.Context, dir, raw string) ([]string, error) {
 	plans, err := chooseFormats(ctx, raw)
@@ -944,6 +964,31 @@ func (a *api) keepVideoProgress(ctx context.Context, chatID int64) {
 
 func (a *api) sendVideoProgress(ctx context.Context, chatID int64) error {
 	return a.call(ctx, "sendChatAction", map[string]any{"chat_id": chatID, "action": "typing"}, nil)
+}
+
+func (a *api) setMessageReaction(ctx context.Context, chatID, messageID int64, emoji string) error {
+	reactions := []map[string]string{}
+	if emoji != "" {
+		reactions = append(reactions, map[string]string{"type": "emoji", "emoji": emoji})
+	}
+	return a.call(ctx, "setMessageReaction", map[string]any{
+		"chat_id":    chatID,
+		"message_id": messageID,
+		"reaction":   reactions,
+	}, nil)
+}
+
+func (a *api) clearReactionAfter(ctx context.Context, chatID, messageID int64, delay time.Duration) {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+	}
+	clearCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	_ = a.setMessageReaction(clearCtx, chatID, messageID, "")
 }
 
 func (a *api) sendCached(ctx context.Context, j job, ids []string) error {

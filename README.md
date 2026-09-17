@@ -8,9 +8,9 @@ A small Go Telegram bot that replies to messages containing video-page URLs. It 
 - Supports public pages handled by `yt-dlp`; multi-video posts return up to five
   videos together as one Telegram media album. General playlists and live
   streams remain rejected.
-- Shows Telegram's native typing activity indicator while uncached
-  group and supergroup requests are being processed; it creates no progress
-  messages and stops when processing finishes.
+- Marks uncached group and supergroup requests with a temporary `👀` reaction
+  while processing, briefly changes it to `👍` after delivery, and also refreshes
+  Telegram's native typing action as a fallback. It creates no progress message.
 - Selects the highest-quality source estimated to fit, normalizes it for Telegram,
   and uses a duration-aware size-targeted transcode if the prepared file would
   otherwise exceed 49 MB. Media longer than one hour is rejected when duration
