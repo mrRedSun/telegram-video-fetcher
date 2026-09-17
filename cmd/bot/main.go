@@ -330,6 +330,11 @@ func processJob(ctx context.Context, cfg config, a *api, c *cache, j job) {
 	progressCtx, stopProgress := context.WithCancel(ctx)
 	defer stopProgress()
 	if j.ChatType == "group" || j.ChatType == "supergroup" {
+		// Send the first action synchronously so fast jobs cannot finish and
+		// cancel the context before Telegram receives any visible indication.
+		if err := a.sendVideoProgress(progressCtx, j.ChatID); err != nil {
+			slog.Warn("progress action failed")
+		}
 		go a.keepVideoProgress(progressCtx, j.ChatID)
 	}
 
@@ -928,13 +933,17 @@ func (a *api) keepVideoProgress(ctx context.Context, chatID int64) {
 	ticker := time.NewTicker(4 * time.Second)
 	defer ticker.Stop()
 	for {
-		_ = a.call(ctx, "sendChatAction", map[string]any{"chat_id": chatID, "action": "upload_video"}, nil)
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			_ = a.sendVideoProgress(ctx, chatID)
 		}
 	}
+}
+
+func (a *api) sendVideoProgress(ctx context.Context, chatID int64) error {
+	return a.call(ctx, "sendChatAction", map[string]any{"chat_id": chatID, "action": "typing"}, nil)
 }
 
 func (a *api) sendCached(ctx context.Context, j job, ids []string) error {
