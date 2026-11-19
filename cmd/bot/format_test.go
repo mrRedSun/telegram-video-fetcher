@@ -100,7 +100,7 @@ func TestPlansEveryVideoInMultiVideoPost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plans, err := plansFromMetadata(raw)
+	plans, err := plansFromMetadata(raw, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,11 +122,11 @@ func TestMultiVideoPostIsCappedAtFiveItems(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plans, err := plansFromMetadata(raw)
+	plans, err := plansFromMetadata(raw, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(plans) != maxVideosPerPost {
-		t.Fatalf("got %d plans, want %d", len(plans), maxVideosPerPost)
+	if len(plans) != maxAlbumItems {
+		t.Fatalf("got %d plans, want %d", len(plans), maxAlbumItems)
 	}
 }

@@ -36,20 +36,20 @@ func TestUploadAlbumUsesOneOrderedMediaGroup(t *testing.T) {
 	defer server.Close()
 
 	dir := t.TempDir()
-	videos := make([]preparedVideo, 2)
+	videos := make([]preparedMedia, 2)
 	for i := range videos {
 		path := filepath.Join(dir, fmt.Sprintf("video-%d.mp4", i))
 		if err := os.WriteFile(path, []byte(fmt.Sprintf("video-%d", i)), 0600); err != nil {
 			t.Fatal(err)
 		}
-		videos[i] = preparedVideo{Path: path, Meta: videoMeta{Width: 1920, Height: 1080, Duration: 6}}
+		videos[i] = preparedMedia{Kind: kindVideo, Path: path, Meta: videoMeta{Width: 1920, Height: 1080, Duration: 6}}
 	}
 	a := &api{base: server.URL, client: server.Client()}
 	ids, err := a.uploadAlbum(t.Context(), job{ChatID: 1, MessageID: 2}, videos)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ids) != 2 || ids[0] != "first" || ids[1] != "second" {
+	if len(ids) != 2 || ids[0] != (cachedMedia{Type: kindVideo, FileID: "first"}) || ids[1] != (cachedMedia{Type: kindVideo, FileID: "second"}) {
 		t.Fatalf("unexpected file IDs: %#v", ids)
 	}
 }
