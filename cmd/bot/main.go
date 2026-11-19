@@ -31,7 +31,7 @@ import (
 
 const maxUpload = int64(49_000_000)
 const transcodeTarget = int64(47_000_000)
-const maxVideosPerPost = 5
+const maxAlbumItems = 5
 
 var urlRE = regexp.MustCompile(`https?://[^\s<>]+`)
 
@@ -85,8 +85,24 @@ type tgResponse struct {
 	Result      json.RawMessage `json:"result"`
 }
 type sentMessage struct {
-	Video    *tgFile `json:"video"`
-	Document *tgFile `json:"document"`
+	Video    *tgFile  `json:"video"`
+	Document *tgFile  `json:"document"`
+	Photo    []tgFile `json:"photo"`
+}
+
+// mediaKind is the Telegram media type an item is delivered and cached as.
+type mediaKind string
+
+const (
+	kindVideo    mediaKind = "video"
+	kindPhoto    mediaKind = "photo"
+	kindDocument mediaKind = "document"
+)
+
+// cachedMedia is one delivered item: its Telegram file_id and how to resend it.
+type cachedMedia struct {
+	Type   mediaKind `json:"type"`
+	FileID string    `json:"file_id"`
 }
 type tgFile struct {
 	FileID   string `json:"file_id"`
@@ -98,6 +114,12 @@ type mediaInfo struct {
 	Extractor string            `json:"extractor_key"`
 	Formats   []mediaFormat     `json:"formats"`
 	Entries   []json.RawMessage `json:"entries"`
+	// yt-dlp exposes Instagram images only as thumbnails; "thumbnail" is the
+	// preferred (full-resolution) candidate and the list is ordered worst-first.
+	Thumbnail  string `json:"thumbnail"`
+	Thumbnails []struct {
+		URL string `json:"url"`
+	} `json:"thumbnails"`
 }
 
 type mediaFormat struct {
@@ -121,11 +143,21 @@ type videoMeta struct {
 }
 
 type downloadPlan struct {
-	Info     json.RawMessage
-	Selector string
+	Kind     mediaKind
+	Info     json.RawMessage // video items: yt-dlp metadata snapshot
+	Selector string          // video items: yt-dlp format selector
+	PhotoURL string          // photo items: CDN URL of the full-size image
 }
 
-type preparedVideo struct {
+type downloadedMedia struct {
+	Kind mediaKind
+	Path string
+}
+
+// preparedMedia is an upload-ready file. Meta carries dimensions for photos
+// and dimensions plus duration for videos.
+type preparedMedia struct {
+	Kind mediaKind
 	Path string
 	Meta videoMeta
 }
@@ -159,23 +191,21 @@ func main() {
 			panic(err)
 		}
 		defer os.RemoveAll(dir)
-		paths, err := download(ctx, dir, probe)
+		source, instagram := instagramSource(probe)
+		items, err := download(ctx, dir, source, instagram && instagramAllowsPhotos(source))
 		if err != nil {
 			panic(err)
 		}
-		for i, path := range paths {
-			path, meta, err := prepareTelegramVideo(ctx, filepath.Dir(path), path)
+		prepared, err := prepareMedia(ctx, items)
+		if err != nil {
+			panic(err)
+		}
+		for i, m := range prepared {
+			st, err := os.Stat(m.Path)
 			if err != nil {
 				panic(err)
 			}
-			st, err := os.Stat(path)
-			if err != nil {
-				panic(err)
-			}
-			if st.Size() > maxUpload {
-				panic("probe output exceeds upload limit")
-			}
-			slog.Info("probe item succeeded", "item", i+1, "items", len(paths), "bytes", st.Size(), "file", filepath.Base(path), "width", meta.Width, "height", meta.Height, "duration", meta.Duration)
+			slog.Info("probe item succeeded", "item", i+1, "items", len(prepared), "type", m.Kind, "bytes", st.Size(), "file", filepath.Base(m.Path), "width", m.Meta.Width, "height", m.Meta.Height, "duration", m.Meta.Duration)
 		}
 		return
 	}
@@ -319,9 +349,16 @@ func worker(ctx context.Context, cfg config, a *api, c *cache, jobs <-chan job) 
 }
 
 func processJob(ctx context.Context, cfg config, a *api, c *cache, j job) {
+	source, instagram := instagramSource(j.URL)
+	photos := instagram && instagramAllowsPhotos(source)
 	key := "media-v4:" + normalize(j.URL)
-	if ids, _ := c.getFileIDs(key); len(ids) > 0 {
-		if err := a.sendCached(ctx, j, ids); err == nil {
+	if instagram {
+		// Instagram results may contain photos, so they use a separate
+		// namespace from the video-only entries cached before photo support.
+		key = "media-v5:" + normalize(source)
+	}
+	if items, _ := c.getMedia(key); len(items) > 0 {
+		if err := a.sendCached(ctx, j, items); err == nil {
 			_ = c.recordOutcome(true, true)
 			return
 		}
@@ -365,51 +402,74 @@ func processJob(ctx context.Context, cfg config, a *api, c *cache, j job) {
 		return
 	}
 	defer os.RemoveAll(dir)
-	paths, err := download(dctx, dir, j.URL)
+	items, err := download(dctx, dir, source, photos)
 	if err != nil {
 		slog.Warn("download failed", "error", err, "host", host(j.URL))
 		_ = c.recordOutcome(false, false)
 		return
 	}
-	prepared := make([]preparedVideo, 0, len(paths))
-	for _, source := range paths {
-		path, meta, prepareErr := prepareTelegramVideo(dctx, filepath.Dir(source), source)
-		if prepareErr != nil {
-			err = prepareErr
-			break
-		}
-		st, statErr := os.Stat(path)
-		if statErr != nil || st.Size() > maxUpload {
-			err = errors.New("prepared video exceeds upload limit")
-			break
-		}
-		if path != source {
-			_ = os.Remove(source)
-		}
-		prepared = append(prepared, preparedVideo{Path: path, Meta: meta})
-	}
+	prepared, err := prepareMedia(dctx, items)
 	cancel()
 	if err != nil {
 		slog.Warn("media validation failed", "error", err, "host", host(j.URL))
 		_ = c.recordOutcome(false, false)
 		return
 	}
-	fileIDs, err := a.upload(ctx, j, prepared)
+	sent, err := a.upload(ctx, j, prepared)
 	if err != nil {
 		slog.Error("upload failed", "error", err, "host", host(j.URL))
 		_ = c.recordOutcome(false, false)
 		return
 	}
-	_ = c.putFileIDs(key, fileIDs)
+	_ = c.putMedia(key, sent)
 	_ = c.recordOutcome(true, false)
 	delivered = true
 }
-func download(ctx context.Context, dir, raw string) ([]string, error) {
-	plans, err := chooseFormats(ctx, raw)
+
+// prepareMedia turns downloaded files into upload-ready Telegram media.
+func prepareMedia(ctx context.Context, items []downloadedMedia) ([]preparedMedia, error) {
+	prepared := make([]preparedMedia, 0, len(items))
+	for _, item := range items {
+		if item.Kind == kindPhoto {
+			photo, err := preparePhoto(item.Path)
+			if err != nil {
+				return nil, err
+			}
+			prepared = append(prepared, photo)
+			continue
+		}
+		path, meta, err := prepareTelegramVideo(ctx, filepath.Dir(item.Path), item.Path)
+		if err != nil {
+			return nil, err
+		}
+		st, err := os.Stat(path)
+		if err != nil || st.Size() > maxUpload {
+			return nil, errors.New("prepared video exceeds upload limit")
+		}
+		if path != item.Path {
+			_ = os.Remove(item.Path)
+		}
+		prepared = append(prepared, preparedMedia{Kind: kindVideo, Path: path, Meta: meta})
+	}
+	if len(prepared) > 1 {
+		for _, m := range prepared {
+			// Telegram cannot mix documents with photos/videos in one album.
+			if m.Kind == kindDocument {
+				return nil, errors.New("album photo exceeds Telegram photo limits")
+			}
+		}
+	}
+	return prepared, nil
+}
+
+// download fetches every planned item of raw into dir. Photo items are only
+// planned when photos is true (Instagram); otherwise behaviour is video-only.
+func download(ctx context.Context, dir, raw string, photos bool) ([]downloadedMedia, error) {
+	plans, err := chooseFormats(ctx, raw, photos)
 	if err != nil {
 		return nil, err
 	}
-	paths := make([]string, 0, len(plans))
+	items := make([]downloadedMedia, 0, len(plans))
 	for i, plan := range plans {
 		itemDir := dir
 		if len(plans) > 1 {
@@ -417,6 +477,15 @@ func download(ctx context.Context, dir, raw string) ([]string, error) {
 			if err := os.Mkdir(itemDir, 0700); err != nil {
 				return nil, err
 			}
+		}
+		if plan.Kind == kindPhoto {
+			slog.Info("photo selected", "item", i+1, "items", len(plans), "host", host(raw))
+			path, err := downloadPhoto(ctx, photoClient, itemDir, plan.PhotoURL)
+			if err != nil {
+				return nil, fmt.Errorf("photo item %d: %w", i+1, err)
+			}
+			items = append(items, downloadedMedia{Kind: kindPhoto, Path: path})
+			continue
 		}
 		infoPath := filepath.Join(itemDir, "media-info.json")
 		if err := os.WriteFile(infoPath, plan.Info, 0600); err != nil {
@@ -434,22 +503,30 @@ func download(ctx context.Context, dir, raw string) ([]string, error) {
 		if len(files) != 1 {
 			return nil, fmt.Errorf("item %d produced no single output", i+1)
 		}
-		paths = append(paths, files[0])
+		items = append(items, downloadedMedia{Kind: kindVideo, Path: files[0]})
 	}
-	return paths, nil
+	return items, nil
 }
 
-func chooseFormats(ctx context.Context, raw string) ([]downloadPlan, error) {
-	cmd := exec.CommandContext(ctx, "yt-dlp", "--dump-single-json", "--skip-download", "--no-playlist", "--playlist-end", strconv.Itoa(maxVideosPerPost), "--no-warnings", "--", raw)
+func chooseFormats(ctx context.Context, raw string, photos bool) ([]downloadPlan, error) {
+	args := []string{"--dump-single-json", "--skip-download", "--no-playlist", "--playlist-end", strconv.Itoa(maxAlbumItems), "--no-warnings"}
+	if photos {
+		// Without this, yt-dlp aborts on Instagram photo posts and carousel
+		// photo entries instead of returning their image candidates.
+		args = append(args, "--ignore-no-formats-error")
+	}
+	cmd := exec.CommandContext(ctx, "yt-dlp", append(args, "--", raw)...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("metadata: %w: %.300s", err, stderr.String())
 	}
-	return plansFromMetadata(stdout.Bytes())
+	return plansFromMetadata(stdout.Bytes(), photos)
 }
 
-func plansFromMetadata(raw []byte) ([]downloadPlan, error) {
+// plansFromMetadata plans up to maxAlbumItems items in source order. When
+// photos is true, an item without any video format becomes a photo item.
+func plansFromMetadata(raw []byte, photos bool) ([]downloadPlan, error) {
 	var info mediaInfo
 	if err := json.Unmarshal(raw, &info); err != nil {
 		return nil, fmt.Errorf("metadata JSON: %w", err)
@@ -457,8 +534,8 @@ func plansFromMetadata(raw []byte) ([]downloadPlan, error) {
 	items := []json.RawMessage{json.RawMessage(raw)}
 	if len(info.Entries) > 0 {
 		items = info.Entries
-		if len(items) > maxVideosPerPost {
-			items = items[:maxVideosPerPost]
+		if len(items) > maxAlbumItems {
+			items = items[:maxAlbumItems]
 		}
 	}
 	plans := make([]downloadPlan, 0, len(items))
@@ -470,6 +547,17 @@ func plansFromMetadata(raw []byte) ([]downloadPlan, error) {
 		if err := json.Unmarshal(rawInfo, &item); err != nil {
 			return nil, fmt.Errorf("metadata JSON item %d: %w", i+1, err)
 		}
+		if photos && len(item.Formats) == 0 {
+			photoURL := item.Thumbnail
+			if photoURL == "" && len(item.Thumbnails) > 0 {
+				photoURL = item.Thumbnails[len(item.Thumbnails)-1].URL
+			}
+			if photoURL == "" {
+				return nil, fmt.Errorf("item %d has neither video formats nor an image", i+1)
+			}
+			plans = append(plans, downloadPlan{Kind: kindPhoto, PhotoURL: photoURL})
+			continue
+		}
 		if item.Duration > 3600 {
 			return nil, fmt.Errorf("video item %d exceeds the one-hour duration limit", i+1)
 		}
@@ -477,7 +565,7 @@ func plansFromMetadata(raw []byte) ([]downloadPlan, error) {
 		if !ok {
 			return nil, fmt.Errorf("no video format fits the size budget for item %d", i+1)
 		}
-		plans = append(plans, downloadPlan{Info: append(json.RawMessage(nil), rawInfo...), Selector: choice.Selector})
+		plans = append(plans, downloadPlan{Kind: kindVideo, Info: append(json.RawMessage(nil), rawInfo...), Selector: choice.Selector})
 	}
 	if len(plans) == 0 {
 		return nil, errors.New("post has no downloadable videos")
@@ -897,30 +985,68 @@ func (c *cache) put(k, v string) error {
 	return c.db.Update(func(tx *bolt.Tx) error { return tx.Bucket([]byte("files")).Put([]byte(k), []byte(v)) })
 }
 
-func (c *cache) getFileIDs(k string) ([]string, error) {
+// getMedia decodes a cached entry. Legacy values are a bare file_id (one
+// video) or a JSON string array (a video album); typed values are a JSON array
+// of cachedMedia.
+func (c *cache) getMedia(k string) ([]cachedMedia, error) {
 	raw, err := c.get(k)
 	if err != nil || raw == "" {
 		return nil, err
 	}
-	if !strings.HasPrefix(raw, "[") {
-		return []string{raw}, nil
-	}
-	var ids []string
-	if err := json.Unmarshal([]byte(raw), &ids); err != nil {
-		return nil, err
-	}
-	return ids, nil
+	return decodeCachedMedia(raw)
 }
 
-func (c *cache) putFileIDs(k string, ids []string) error {
-	if len(ids) == 1 {
-		return c.put(k, ids[0])
-	}
-	raw, err := json.Marshal(ids)
+func (c *cache) putMedia(k string, items []cachedMedia) error {
+	raw, err := encodeCachedMedia(items)
 	if err != nil {
 		return err
 	}
-	return c.put(k, string(raw))
+	return c.put(k, raw)
+}
+
+func decodeCachedMedia(raw string) ([]cachedMedia, error) {
+	if !strings.HasPrefix(raw, "[") {
+		return []cachedMedia{{Type: kindVideo, FileID: raw}}, nil
+	}
+	var ids []string
+	if err := json.Unmarshal([]byte(raw), &ids); err == nil {
+		items := make([]cachedMedia, 0, len(ids))
+		for _, id := range ids {
+			items = append(items, cachedMedia{Type: kindVideo, FileID: id})
+		}
+		return items, nil
+	}
+	var items []cachedMedia
+	if err := json.Unmarshal([]byte(raw), &items); err != nil {
+		return nil, err
+	}
+	for _, item := range items {
+		if item.FileID == "" || (item.Type != kindVideo && item.Type != kindPhoto && item.Type != kindDocument) {
+			return nil, errors.New("invalid cached media entry")
+		}
+	}
+	return items, nil
+}
+
+// encodeCachedMedia keeps the legacy encoding for video-only results so
+// existing readers (including a rolled-back release) still understand them.
+func encodeCachedMedia(items []cachedMedia) (string, error) {
+	if len(items) == 0 {
+		return "", errors.New("no media to cache")
+	}
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		if item.Type != kindVideo {
+			raw, err := json.Marshal(items)
+			return string(raw), err
+		}
+		ids = append(ids, item.FileID)
+	}
+	if len(ids) == 1 {
+		return ids[0], nil
+	}
+	raw, err := json.Marshal(ids)
+	return string(raw), err
 }
 
 func (a *api) call(ctx context.Context, method string, payload any, result any) error {
@@ -991,30 +1117,68 @@ func (a *api) clearReactionAfter(ctx context.Context, chatID, messageID int64, d
 	_ = a.setMessageReaction(clearCtx, chatID, messageID, "")
 }
 
-func (a *api) sendCached(ctx context.Context, j job, ids []string) error {
-	if len(ids) == 1 {
-		return a.call(ctx, "sendVideo", map[string]any{"chat_id": j.ChatID, "reply_parameters": map[string]any{"message_id": j.MessageID}, "video": ids[0]}, nil)
+func (a *api) sendCached(ctx context.Context, j job, items []cachedMedia) error {
+	reply := map[string]any{"message_id": j.MessageID}
+	if len(items) == 1 {
+		item := items[0]
+		payload := map[string]any{"chat_id": j.ChatID, "reply_parameters": reply, string(item.Type): item.FileID}
+		return a.call(ctx, sendMethod(item.Type), payload, nil)
 	}
-	media := make([]map[string]any, 0, len(ids))
-	for _, id := range ids {
-		media = append(media, map[string]any{"type": "video", "media": id, "supports_streaming": true})
+	media := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		entry := map[string]any{"type": string(item.Type), "media": item.FileID}
+		if item.Type == kindVideo {
+			entry["supports_streaming"] = true
+		}
+		media = append(media, entry)
 	}
-	return a.call(ctx, "sendMediaGroup", map[string]any{"chat_id": j.ChatID, "reply_parameters": map[string]any{"message_id": j.MessageID}, "media": media}, nil)
+	return a.call(ctx, "sendMediaGroup", map[string]any{"chat_id": j.ChatID, "reply_parameters": reply, "media": media}, nil)
 }
 
-func (a *api) upload(ctx context.Context, j job, videos []preparedVideo) ([]string, error) {
-	if len(videos) == 1 {
-		id, err := a.uploadOne(ctx, j, videos[0])
+func sendMethod(kind mediaKind) string {
+	switch kind {
+	case kindPhoto:
+		return "sendPhoto"
+	case kindDocument:
+		return "sendDocument"
+	default:
+		return "sendVideo"
+	}
+}
+
+// sentFileID extracts the reusable file_id of the given kind from a sent
+// message. For photos Telegram returns all sizes; the last is the largest.
+func sentFileID(sent sentMessage, kind mediaKind) (string, bool) {
+	switch kind {
+	case kindPhoto:
+		if len(sent.Photo) > 0 && sent.Photo[len(sent.Photo)-1].FileID != "" {
+			return sent.Photo[len(sent.Photo)-1].FileID, true
+		}
+	case kindDocument:
+		if sent.Document != nil && sent.Document.FileID != "" {
+			return sent.Document.FileID, true
+		}
+	default:
+		if sent.Video != nil && sent.Video.FileID != "" {
+			return sent.Video.FileID, true
+		}
+	}
+	return "", false
+}
+
+func (a *api) upload(ctx context.Context, j job, items []preparedMedia) ([]cachedMedia, error) {
+	if len(items) == 1 {
+		id, err := a.uploadOne(ctx, j, items[0])
 		if err != nil {
 			return nil, err
 		}
-		return []string{id}, nil
+		return []cachedMedia{{Type: items[0].Kind, FileID: id}}, nil
 	}
-	return a.uploadAlbum(ctx, j, videos)
+	return a.uploadAlbum(ctx, j, items)
 }
 
-func (a *api) uploadOne(ctx context.Context, j job, video preparedVideo) (string, error) {
-	f, e := os.Open(video.Path)
+func (a *api) uploadOne(ctx context.Context, j job, item preparedMedia) (string, error) {
+	f, e := os.Open(item.Path)
 	if e != nil {
 		return "", e
 	}
@@ -1023,11 +1187,13 @@ func (a *api) uploadOne(ctx context.Context, j job, video preparedVideo) (string
 	w := multipart.NewWriter(&b)
 	_ = w.WriteField("chat_id", strconv.FormatInt(j.ChatID, 10))
 	_ = w.WriteField("reply_parameters", fmt.Sprintf(`{"message_id":%d}`, j.MessageID))
-	_ = w.WriteField("width", strconv.Itoa(video.Meta.Width))
-	_ = w.WriteField("height", strconv.Itoa(video.Meta.Height))
-	_ = w.WriteField("duration", strconv.Itoa(video.Meta.Duration))
-	_ = w.WriteField("supports_streaming", "true")
-	p, e := w.CreateFormFile("video", filepath.Base(video.Path))
+	if item.Kind == kindVideo {
+		_ = w.WriteField("width", strconv.Itoa(item.Meta.Width))
+		_ = w.WriteField("height", strconv.Itoa(item.Meta.Height))
+		_ = w.WriteField("duration", strconv.Itoa(item.Meta.Duration))
+		_ = w.WriteField("supports_streaming", "true")
+	}
+	p, e := w.CreateFormFile(string(item.Kind), filepath.Base(item.Path))
 	if e != nil {
 		return "", e
 	}
@@ -1035,7 +1201,7 @@ func (a *api) uploadOne(ctx context.Context, j job, video preparedVideo) (string
 		return "", e
 	}
 	w.Close()
-	req, e := http.NewRequestWithContext(ctx, "POST", a.base+"/sendVideo", &b)
+	req, e := http.NewRequestWithContext(ctx, "POST", a.base+"/"+sendMethod(item.Kind), &b)
 	if e != nil {
 		return "", e
 	}
@@ -1054,36 +1220,44 @@ func (a *api) uploadOne(ctx context.Context, j job, video preparedVideo) (string
 		return "", errors.New(r.Description)
 	}
 	var sent sentMessage
-	if e = json.Unmarshal(r.Result, &sent); e != nil || sent.Video == nil {
-		return "", errors.New("missing video file_id")
+	if e = json.Unmarshal(r.Result, &sent); e != nil {
+		return "", e
 	}
-	return sent.Video.FileID, nil
+	id, ok := sentFileID(sent, item.Kind)
+	if !ok {
+		return "", fmt.Errorf("missing %s file_id", item.Kind)
+	}
+	return id, nil
 }
 
-func (a *api) uploadAlbum(ctx context.Context, j job, videos []preparedVideo) ([]string, error) {
-	if len(videos) < 2 || len(videos) > maxVideosPerPost {
-		return nil, fmt.Errorf("invalid album size %d", len(videos))
+func (a *api) uploadAlbum(ctx context.Context, j job, items []preparedMedia) ([]cachedMedia, error) {
+	if len(items) < 2 || len(items) > maxAlbumItems {
+		return nil, fmt.Errorf("invalid album size %d", len(items))
 	}
 	var b bytes.Buffer
 	w := multipart.NewWriter(&b)
 	_ = w.WriteField("chat_id", strconv.FormatInt(j.ChatID, 10))
 	_ = w.WriteField("reply_parameters", fmt.Sprintf(`{"message_id":%d}`, j.MessageID))
-	media := make([]map[string]any, 0, len(videos))
-	for i, video := range videos {
-		name := fmt.Sprintf("video%d", i)
-		media = append(media, map[string]any{
-			"type":               "video",
-			"media":              "attach://" + name,
-			"width":              video.Meta.Width,
-			"height":             video.Meta.Height,
-			"duration":           video.Meta.Duration,
-			"supports_streaming": true,
-		})
-		f, err := os.Open(video.Path)
+	media := make([]map[string]any, 0, len(items))
+	for i, item := range items {
+		name := fmt.Sprintf("%s%d", item.Kind, i)
+		entry := map[string]any{"type": string(item.Kind), "media": "attach://" + name}
+		switch item.Kind {
+		case kindVideo:
+			entry["width"] = item.Meta.Width
+			entry["height"] = item.Meta.Height
+			entry["duration"] = item.Meta.Duration
+			entry["supports_streaming"] = true
+		case kindPhoto:
+		default:
+			return nil, fmt.Errorf("album item %d has unsupported type %s", i+1, item.Kind)
+		}
+		media = append(media, entry)
+		f, err := os.Open(item.Path)
 		if err != nil {
 			return nil, err
 		}
-		part, err := w.CreateFormFile(name, filepath.Base(video.Path))
+		part, err := w.CreateFormFile(name, filepath.Base(item.Path))
 		if err == nil {
 			_, err = io.Copy(part, f)
 		}
@@ -1127,15 +1301,16 @@ func (a *api) uploadAlbum(ctx context.Context, j job, videos []preparedVideo) ([
 	if err := json.Unmarshal(response.Result, &sent); err != nil {
 		return nil, err
 	}
-	if len(sent) != len(videos) {
+	if len(sent) != len(items) {
 		return nil, errors.New("Telegram returned an incomplete media group")
 	}
-	ids := make([]string, 0, len(sent))
-	for _, message := range sent {
-		if message.Video == nil || message.Video.FileID == "" {
-			return nil, errors.New("missing video file_id in media group")
+	out := make([]cachedMedia, 0, len(sent))
+	for i, message := range sent {
+		id, ok := sentFileID(message, items[i].Kind)
+		if !ok {
+			return nil, fmt.Errorf("missing %s file_id in media group", items[i].Kind)
 		}
-		ids = append(ids, message.Video.FileID)
+		out = append(out, cachedMedia{Type: items[i].Kind, FileID: id})
 	}
-	return ids, nil
+	return out, nil
 }
